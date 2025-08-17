@@ -14,6 +14,7 @@ import argparse
 import logging
 import yaml
 from pathlib import Path
+import sys
 import torch
 from tqdm import tqdm
 import json
@@ -21,15 +22,30 @@ import numpy as np
 from datetime import datetime
 
 # Project imports
-from polytope_hsae.geometry import CausalGeometry, compute_polytope_angles, intervention_test
-from polytope_hsae.estimators import ConceptVectorEstimator, LDAEstimator, validate_orthogonality
-from polytope_hsae.validation import GeometryValidator
-from polytope_hsae.concepts import ConceptCurator, PromptGenerator, ConceptSplitter
-from polytope_hsae.activations import ActivationCapture, ActivationConfig
-from transformers import AutoModel, AutoTokenizer
+sys.path.append(str(Path(__file__).resolve().parents[1] / "polytope_hsae"))
+
+from geometry import CausalGeometry, compute_polytope_angles, intervention_test
+from estimators import ConceptVectorEstimator, LDAEstimator, validate_orthogonality
+from validation import GeometryValidator
+from concepts import ConceptCurator, PromptGenerator, ConceptSplitter
+from activations import ActivationCapture, ActivationConfig
+from transformers import AutoModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _get_torch_dtype(dtype_str: str) -> torch.dtype:
+    """Map a string dtype to a torch dtype."""
+    mapping = {
+        'bf16': torch.bfloat16,
+        'bfloat16': torch.bfloat16,
+        'float32': torch.float32,
+        'fp32': torch.float32,
+        'float16': torch.float16,
+        'fp16': torch.float16,
+    }
+    return mapping.get(dtype_str, torch.float32)
 
 
 def setup_experiment(config):
@@ -53,7 +69,7 @@ def load_or_create_concepts(config, exp_dir):
     
     if concepts_file.exists():
         logger.info("Loading existing concept hierarchies")
-        from polytope_hsae.concepts import load_concept_hierarchies
+        from concepts import load_concept_hierarchies
         hierarchies = load_concept_hierarchies(str(concepts_file))
     else:
         logger.info("Creating new concept hierarchies")
@@ -76,7 +92,7 @@ def load_or_create_concepts(config, exp_dir):
         hierarchies = [prompt_generator.populate_hierarchy_prompts(h) for h in hierarchies]
         
         # Save concepts
-        from polytope_hsae.concepts import save_concept_hierarchies
+        from concepts import save_concept_hierarchies
         save_concept_hierarchies(hierarchies, str(concepts_file))
     
     logger.info(f"Using {len(hierarchies)} concept hierarchies")
@@ -86,6 +102,8 @@ def load_or_create_concepts(config, exp_dir):
 def capture_activations(config, hierarchies, exp_dir):
     """Capture activations for all concepts."""
     activations_file = exp_dir / "activations.h5"
+
+    torch_dtype = _get_torch_dtype(config['model'].get('dtype', 'float32'))
     
     if activations_file.exists():
         logger.info("Loading existing activations")
@@ -93,7 +111,8 @@ def capture_activations(config, hierarchies, exp_dir):
             model_name=config['model']['name'],
             layer_name=config['model']['activation_hook'],
             batch_size=32,
-            device=config['run']['device']
+            device=config['run']['device'],
+            dtype=torch_dtype,
         ))
         return activation_capture.load_hierarchical_activations(str(activations_file))
     
@@ -104,7 +123,8 @@ def capture_activations(config, hierarchies, exp_dir):
         model_name=config['model']['name'],
         layer_name=config['model']['activation_hook'],
         batch_size=32,
-        device=config['run']['device']
+        device=config['run']['device'],
+        dtype=torch_dtype,
     )
     
     activation_capture = ActivationCapture(activation_config)
@@ -119,7 +139,7 @@ def capture_activations(config, hierarchies, exp_dir):
     return activations
 
 
-def extract_teacher_vectors(config, activations, exp_dir):
+def extract_teacher_vectors(config, hierarchies, activations, exp_dir):
     """Extract parent vectors and child deltas using LDA."""
     logger.info("Extracting teacher vectors")
     
@@ -138,11 +158,14 @@ def extract_teacher_vectors(config, activations, exp_dir):
             break
     
     if unembedding_matrix is None:
-        # Fallback: use embed_tokens transposed
+        # Fallback: use token embeddings transposed
         if hasattr(model, 'embed_tokens'):
             unembedding_matrix = model.embed_tokens.weight.data.T
         else:
-            raise ValueError("Could not find unembedding matrix")
+            try:
+                unembedding_matrix = model.get_input_embeddings().weight.data.T
+            except Exception as e:
+                raise ValueError("Could not find unembedding matrix") from e
     
     logger.info(f"Unembedding matrix shape: {unembedding_matrix.shape}")
     
@@ -296,6 +319,11 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="Path to config file")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run a quick CPU-based smoke test with minimal settings",
+    )
     
     args = parser.parse_args()
     
@@ -305,10 +333,20 @@ def main():
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-    
+
     # Override device if specified
     if args.device:
         config['run']['device'] = args.device
+
+    if args.dry_run:
+        logger.info("Running in dry-run mode - overriding config for CPU test")
+        config['model']['name'] = 'distilbert-base-uncased'
+        config['model']['activation_hook'] = 'layer_norm'
+        config['model']['dtype'] = 'float32'
+        config['concepts']['parents'] = 2
+        config['concepts']['max_children_per_parent'] = 2
+        config['concepts']['prompts_per_concept'] = 4
+        config['run']['device'] = 'cpu'
     
     # Set up experiment
     exp_dir = setup_experiment(config)
@@ -321,7 +359,7 @@ def main():
     
     # Extract teacher vectors
     parent_vectors, child_deltas, projectors, geometry = extract_teacher_vectors(
-        config, activations, exp_dir
+        config, hierarchies, activations, exp_dir
     )
     
     # Validate geometry

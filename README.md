@@ -64,6 +64,23 @@ Or run all phases sequentially:
 python experiments/run_all_phases.py --config configs/v2-focused.yaml
 ```
 
+### CPU Dry Run for Development
+
+Use the `--dry-run` flag to execute a quick, CPU-only smoke test that exercises the
+full Phase 1 pipeline with a tiny model and dataset:
+
+```bash
+python experiments/phase1_teacher_extraction.py --config configs/v2-focused.yaml --dry-run
+```
+
+This mode forces the model to `distilbert-base-uncased`, captures only a few concepts and
+prompts, and runs entirely on the CPU so it should finish within a few minutes. You can
+also invoke it via the multi-phase runner:
+
+```bash
+python experiments/run_all_phases.py --config configs/v2-focused.yaml --dry-run --skip-phase2 --skip-phase3 --skip-phase4
+```
+
 ## 📊 Expected Results
 
 ### Phase 1 Validation Targets
