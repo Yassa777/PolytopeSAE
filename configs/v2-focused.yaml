@@ -1,0 +1,117 @@
+# configs/v2-focused.yaml
+# Focused 25-30 GPU-hour experiment based on V2 specification
+
+run:
+  seed: 123
+  device: cuda:0
+  budget_hours: 30
+  notes: "V2 focused experiment: teacher extraction + baseline vs teacher-init H-SAE comparison"
+
+model:
+  name: gemma-2b-it  # or gemma-2b
+  dtype: bf16
+  activation_hook: final_residual_pre_unembed
+  layers_probe: ["last"]  # Single late layer only
+
+data:
+  token_budget: 8_000_000  # Reduced for focused experiment
+  window_length: 128
+  shard_size_tokens: 262_144
+  source: "Wikipedia 20231101 + curated prompts"
+
+concepts:
+  ontology: wordnet
+  parents: 80                    # Reduced from 200 to 80
+  max_children_per_parent: 4     # Capped at 4 most salient
+  prompts_per_concept: 64        # Reduced from 128 to 64
+  split: {train: 0.70, val: 0.15, test: 0.15}
+
+geometry:
+  whitening: unembedding_rows
+  shrinkage: 0.05
+  estimator:
+    type: lda
+    lda_shrinkage: 0.10
+    min_vocab_count: 50
+    class_balance: true
+
+teacher:
+  parent_vectors: "from_final_layer"
+  child_deltas: "LDA_in_parent_subspace"
+  normalize_causal: true
+
+hsae:
+  # Reduced architecture for compute efficiency
+  m_top: 256                 # Reduced from 512
+  topk_parent: 8
+  subspace_dim: 96
+  m_low: 32                  # Reduced from 64
+  topk_child: 1
+  projectors_init: "svd_from_teacher"
+  l1_parent: 1.0e-3
+  l1_child: 1.0e-3
+  biorth_lambda: 5.0e-4      # Down-weighted
+  causal_ortho_lambda: 2.0e-4  # Applied only during freeze stage
+  router_temp: {start: 1.5, end: 0.7}
+
+training:
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  batch_size_acts: 8192
+  
+  # Baseline H-SAE training
+  baseline:
+    total_steps: 7000
+    init_method: "random"
+  
+  # Teacher-initialized H-SAE training  
+  teacher_init:
+    total_steps: 10000
+    stage_A:
+      freeze_decoder: true
+      steps: 1500
+      lr_mult: 0.5
+      enable_causal_ortho: true
+    stage_B:
+      freeze_decoder: false
+      steps: 8500
+      lr_mult: 1.0
+      enable_causal_ortho: false
+      decoder_lr_mult: 0.5  # Lower LR for decoder adaptation
+
+eval:
+  metrics: ["1-EV", "1-CE", "purity", "leakage", "steering_leakage"]
+  steering_layers: ["last"]
+  steering_magnitudes: [0.5, 1.0, 2.0]
+  validation:
+    angle_threshold_deg: 80
+    kl_threshold: 0.10
+    controls:
+      n_shuffles: 100
+      
+  targets:
+    # Acceptance-oriented targets from V2
+    median_angle_deg: 80        # >= 80 degrees
+    purity_improvement: 0.10    # +10pp with teacher-init
+    leakage_reduction: 0.20     # -20% reduction
+    steering_leakage_reduction: 0.20  # -20% reduction
+
+ablate:
+  euclidean_vs_causal: true    # Critical for demonstrating necessity
+  topk_1_vs_2: true
+  no_teacher_init: true
+  randomize_projectors: true
+
+logging:
+  save_dir: "runs/v2_focused"
+  log_every: 50
+  checkpoint_every: 500
+  keep_last_k: 3
+  
+  # Specific logging for phases
+  phase_1_log: "teacher_extraction"
+  phase_2_log: "baseline_hsae" 
+  phase_3_log: "teacher_init_hsae"
+  phase_4_log: "evaluation_steering"

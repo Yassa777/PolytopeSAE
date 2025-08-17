@@ -1,0 +1,98 @@
+# configs/neurips-mi-lowcompute.yaml
+run:
+  seed: 123
+  device: cuda:0
+  budget_hours: 28          # target envelope
+  notes: "One-layer Phase-2 (paper H-SAE) + Phase-3 (teacher-init H-SAE)."
+
+model:
+  name: gemma-2b-it
+  dtype: bf16
+  activation_hook: final_residual_pre_unembed  # λ(x) just before unembedding
+  layers_probe: ["last"]                        # single layer to cap compute
+
+data:
+  # 8–12M tokens keeps capture + training inside budget on A100-40GB.
+  token_budget: 10_000_000
+  window_length: 128
+  shard_size_tokens: 262_144
+  source: "Wikipedia 20231101 + curated prompts"
+
+concepts:
+  ontology: wordnet
+  parents: 120                  # small but diverse slice
+  max_children_per_parent: 6
+  prompts_per_concept: 96
+  split: {train: 0.70, val: 0.15, test: 0.15}
+
+geometry:
+  # Causal inner product via whitening of unembedding rows (A = Cov(γ)^(-1/2)).
+  whitening: unembedding_rows
+  shrinkage: 0.05
+  estimator:
+    type: lda                   # LDA vector estimator for features/deltas
+    lda_shrinkage: 0.10
+    min_vocab_count: 50
+
+teacher:
+  # Build parent vectors ℓ_p and child deltas δ_{c|p} at final layer; map if needed.
+  parent_vectors: "from_final_layer"
+  child_deltas: "LDA_in_parent_subspace"
+  map_to_layer: "ridge_from_probes"   # linear map from final → target layer (if used)
+  normalize_causal: true               # unit norm under causal inner product
+
+hsae:
+  # Hierarchical SAE (paper architecture) with compute-lean widths.
+  m_top: 768                 # number of experts/parent latents
+  topk_parent: 8             # active experts per token
+  subspace_dim: 96           # s (low-dim chart per parent)
+  m_low: 16                  # child atoms per expert; TopK=1 at child level
+  topk_child: 1
+  projectors_init: "svd_from_teacher" # init down/up from child-delta spans
+  l1_parent: 1.0e-3
+  l1_child: 1.0e-3
+  biorth_lambda: 1.0e-3
+  causal_ortho_lambda: 3.0e-4         # early-stage only (see schedule)
+  router_temp: {start: 1.5, end: 0.7}
+
+training:
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  batch_size_acts: 8192
+  total_steps: 22000
+  stage_A:
+    freeze_decoder: true      # "stabilize" per spec
+    steps: 3000
+    lr_mult: 0.5
+    enable_causal_ortho: true
+  stage_B:
+    freeze_decoder: false     # "adapt"
+    steps: 19000
+    lr_mult: 1.0
+    enable_causal_ortho: false
+  early_stop:
+    metric: "val/1-EV"
+    patience: 1500
+    min_delta: 0.0003
+
+eval:
+  metrics: ["1-EV","1-CE","purity","leakage","split_rate","absorb_rate","steering_leakage"]
+  steering_layers: ["last"]
+  steering_magnitudes: [0.5, 1.0, 2.0]
+  probes:
+    parent_activation_auc: true
+    sibling_ratio_invariance: true
+
+ablate:
+  remove_teacher_init: true
+  vary_topk_parent: [4, 12]
+  drop_causal_ortho: true
+  randomize_projectors: true
+
+logging:
+  save_dir: "runs/neurips_lowcompute"
+  log_every: 50
+  checkpoint_every: 1000
+  keep_last_k: 5
