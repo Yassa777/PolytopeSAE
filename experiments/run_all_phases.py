@@ -65,6 +65,8 @@ def main():
     parser.add_argument("--skip-phase3", action="store_true", help="Skip Phase 3 (teacher H-SAE)")
     parser.add_argument("--skip-phase4", action="store_true", help="Skip Phase 4 (evaluation)")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Run Phase 1 with CPU-friendly settings for smoke testing")
     
     args = parser.parse_args()
     
@@ -120,6 +122,8 @@ def main():
             additional_args.extend(["--device", args.device])
         if args.debug:
             additional_args.append("--debug")
+        if args.dry_run and phase_script == "phase1_teacher_extraction.py":
+            additional_args.append("--dry-run")
         
         # Run phase
         phase_script_path = Path(__file__).parent / phase_script
