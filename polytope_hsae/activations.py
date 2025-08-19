@@ -54,23 +54,28 @@ class ActivationCapture:
         self.device = torch.device(config.device)
         self.negative_corpus = negative_corpus
 
-        # Use AutoModelForCausalLM when available to ensure consistent heads;
-        # fall back to AutoModel if necessary.
+        # Load model without device_map to avoid hook/sharding conflicts
         logger.info(f"Loading model {config.model_name}")
+        from transformers import AutoModelForCausalLM, AutoConfig
+        
+        # Load config to enable hidden states output
+        self.hf_config = AutoConfig.from_pretrained(config.model_name)
+        self.hf_config.output_hidden_states = True
+        
         try:
-            from transformers import AutoModelForCausalLM
-
             self.model = AutoModelForCausalLM.from_pretrained(
                 config.model_name,
+                config=self.hf_config,
                 torch_dtype=config.dtype,
-                device_map="auto" if "cuda" in config.device else None,
-            )
+            ).to(self.device)
         except Exception:
+            from transformers import AutoModel
             self.model = AutoModel.from_pretrained(
                 config.model_name,
+                config=self.hf_config,
                 torch_dtype=config.dtype,
-                device_map="auto" if "cuda" in config.device else None,
-            )
+            ).to(self.device)
+            
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
         # Add padding token if missing
@@ -79,24 +84,8 @@ class ActivationCapture:
 
         self.model.eval()
 
-        # Find target layer (or plan B: capture last_hidden_state directly)
-        self.target_layer = None
-        try:
-            if self.config.hook_layer_path:
-                self.target_layer = self._get_module_by_path(
-                    self.config.hook_layer_path
-                )
-            else:
-                self.target_layer = self._find_target_layer()
-            logger.info(f"Target layer: {self.target_layer}")
-        except Exception:
-            logger.warning(
-                "Falling back to capturing last_hidden_state (no explicit hook layer found)."
-            )
-
-        # Storage for captured activations
-        self.captured_activations = []
-        self.hook_handle = None
+        # Model is ready for robust activation capture via hidden_states
+        logger.info("Model loaded and ready for activation capture")
 
     def _find_target_layer(self) -> torch.nn.Module:
         """Find the target layer for activation capture.
@@ -151,15 +140,39 @@ class ActivationCapture:
         # Store activation (detached to avoid gradients)
         self.captured_activations.append(activation.detach().cpu())
 
+    def _get_final_residual(self, outputs):
+        """Get final residual state before unembedding with robust fallbacks."""
+        # Prefer hidden_states[-1] if available (most reliable)
+        if hasattr(outputs, "hidden_states") and outputs.hidden_states:
+            return outputs.hidden_states[-1]
+        
+        # Fallback to last_hidden_state
+        if hasattr(outputs, "last_hidden_state"):
+            return outputs.last_hidden_state
+            
+        # Architecture-specific fallbacks
+        model_type = getattr(self.hf_config, 'model_type', '').lower()
+        
+        if 'gpt' in model_type:
+            # GPT-2 style: try to find transformer.h[-1] output
+            if hasattr(outputs, 'hidden_states') and len(outputs.hidden_states) > 0:
+                return outputs.hidden_states[-1]
+        elif 'gemma' in model_type or 'llama' in model_type:
+            # Gemma/LLaMA style: similar to GPT
+            if hasattr(outputs, 'hidden_states') and len(outputs.hidden_states) > 0:
+                return outputs.hidden_states[-1]
+        
+        raise RuntimeError("Could not retrieve final residual/hidden state")
+
     def capture_batch_activations(self, prompts: List[str]) -> torch.Tensor:
         """
-        Capture activations for a batch of prompts.
+        Capture activations for a batch of prompts using robust final residual extraction.
 
         Args:
             prompts: List of text prompts
 
         Returns:
-            Tensor of activations [batch_size, seq_len, hidden_dim]
+            Tensor of activations [batch_size, seq_len, hidden_dim] (float32, CPU)
         """
         # Tokenize prompts
         inputs = self.tokenizer(
@@ -170,31 +183,15 @@ class ActivationCapture:
             max_length=self.config.max_length,
         ).to(self.device)
 
-        # Clear previous captures
-        self.captured_activations = []
-
-        # Register hook if we have a target layer; else run once and grab last_hidden_state
-        if self.target_layer is not None:
-            self.hook_handle = self.target_layer.register_forward_hook(
-                self._activation_hook
-            )
-
-        try:
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-            if self.captured_activations:
-                activations = self.captured_activations[0]
-                return activations
-            # Fallback: use last_hidden_state if hook approach failed
-            if hasattr(outputs, "last_hidden_state"):
-                return outputs.last_hidden_state.detach().cpu()
-            raise RuntimeError("No activations were captured")
-
-        finally:
-            # Clean up hook
-            if self.hook_handle:
-                self.hook_handle.remove()
-                self.hook_handle = None
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_hidden_states=True)
+            
+        # Get final residual state using robust method
+        acts = self._get_final_residual(outputs)  # [B, T, d] on device
+        
+        # Cast to float32 for HDF5 compatibility and move to CPU
+        acts = acts.float().cpu()
+        return acts
 
     def capture_last_token_activations(self, prompts: List[str]) -> torch.Tensor:
         """
@@ -448,6 +445,28 @@ class ActivationCapture:
             return proc
         _save()
         return None
+
+    @staticmethod
+    def load_hierarchical_activations(path: str) -> Dict[str, Dict[str, torch.Tensor]]:
+        """Load saved hierarchical activations without constructing a model.
+        
+        Args:
+            path: Path to HDF5 file containing saved activations
+            
+        Returns:
+            Dict mapping concept_id -> {'pos': tensor, 'neg': tensor}
+        """
+        data = {}
+        with h5py.File(path, "r") as f:
+            for concept_id in f.keys():
+                grp = f[concept_id]
+                # Load pos and neg datasets (saved as float32)
+                data[concept_id] = {
+                    "pos": torch.from_numpy(grp["pos"][...]),
+                    "neg": torch.from_numpy(grp["neg"][...]),
+                }
+        logger.info(f"Loaded hierarchical activations for {len(data)} concepts from {path}")
+        return data
 
     def load_activations(self, filepath: str) -> Dict[str, torch.Tensor]:
         """Load activations from HDF5 file."""

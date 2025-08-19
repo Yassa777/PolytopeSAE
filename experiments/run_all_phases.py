@@ -85,6 +85,11 @@ def main():
         action="store_true",
         help="Run Phase 1 with CPU-friendly settings for smoke testing",
     )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Never prompt for input; stop on first failure (for CI/HPC)",
+    )
 
     args = parser.parse_args()
 
@@ -187,13 +192,18 @@ def main():
             successful_phases += 1
         else:
             failed_phases += 1
-
-            # Ask user if they want to continue
             logger.error(f"❌ {phase_name} failed!")
-            response = input("Continue with remaining phases? (y/N): ").strip().lower()
-            if response not in ["y", "yes"]:
-                logger.info("🛑 Experiment stopped by user")
+
+            # Handle failure based on interactive mode
+            if args.non_interactive:
+                logger.error("🛑 Stopping due to failure (non-interactive mode)")
                 break
+            else:
+                # Ask user if they want to continue (legacy behavior)
+                response = input("Continue with remaining phases? (y/N): ").strip().lower()
+                if response not in ["y", "yes"]:
+                    logger.info("🛑 Experiment stopped by user")
+                    break
 
     # Final summary
     total_end_time = datetime.now()

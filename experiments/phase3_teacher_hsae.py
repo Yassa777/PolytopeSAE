@@ -99,10 +99,7 @@ def load_activations(config, exp_dir):
 
     logger.info(f"Loading activations from {activations_file}")
 
-    activation_capture = ActivationCapture(None)
-    activations = activation_capture.load_hierarchical_activations(
-        str(activations_file)
-    )
+    activations = ActivationCapture.load_hierarchical_activations(str(activations_file))
 
     # Convert to training format
     all_activations = []

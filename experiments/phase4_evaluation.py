@@ -29,6 +29,7 @@ from polytope_hsae.metrics import (compute_comprehensive_metrics,
 # Project imports
 from polytope_hsae.models import HierarchicalSAE, HSAEConfig
 from polytope_hsae.steering import ConceptSteering, analyze_steering_results
+from polytope_hsae.validation import test_ratio_invariance
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -119,25 +120,48 @@ def load_models_and_data(config):
     return models, parent_vectors, child_deltas, hierarchies
 
 
+def load_eval_loader(config):
+    """Load real captured activations for evaluation."""
+    base_dir = Path(config['logging']['save_dir'])
+    h5_path = base_dir / config['logging']['phase_1_log'] / "activations.h5"
+    
+    if not h5_path.exists():
+        raise FileNotFoundError(f"Activations not found: {h5_path}")
+    
+    logger.info(f"Loading evaluation activations from {h5_path}")
+    acts = ActivationCapture.load_hierarchical_activations(str(h5_path))
+
+    # Concatenate all activations (both pos and neg for comprehensive evaluation)
+    all_acts = []
+    for concept_id, pos_neg_dict in acts.items():
+        all_acts.append(pos_neg_dict['pos'])
+        all_acts.append(pos_neg_dict['neg'])
+    
+    X = torch.cat(all_acts, dim=0)
+    
+    # Apply unit normalization if configured
+    if config.get('data', {}).get('unit_norm', False):
+        X = torch.nn.functional.normalize(X, dim=-1)
+    
+    logger.info(f"Loaded {X.shape[0]} real activation samples for evaluation")
+    
+    dataset = torch.utils.data.TensorDataset(X)
+    return torch.utils.data.DataLoader(
+        dataset, 
+        batch_size=config['training']['batch_size_acts'], 
+        shuffle=False
+    )
+
+
 def run_ablation_studies(models, config, exp_dir):
     """Run ablation studies comparing different configurations."""
-    logger.info("Running ablation studies")
+    logger.info("Running ablation studies on real captured activations")
 
     ablation_results = {}
     device = torch.device(config["run"]["device"])
 
-    # Create synthetic evaluation data
-    input_dim = list(models.values())[0].config.input_dim
-    eval_data = torch.randn(1000, input_dim)
-
-    if config.get("data", {}).get("unit_norm", False):
-        eval_data = torch.nn.functional.normalize(eval_data, dim=-1)
-
-    eval_loader = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(eval_data),
-        batch_size=config["training"]["batch_size_acts"],
-        shuffle=False,
-    )
+    # Load real evaluation data instead of synthetic
+    eval_loader = load_eval_loader(config)
 
     # Evaluate each model
     for model_name, model in models.items():
@@ -293,6 +317,70 @@ def run_steering_experiments(
     return steering_results
 
 
+def run_ratio_invariance_tests(parent_vectors, child_deltas, causal_geometry, config):
+    """Run ratio-invariance tests as required by spec."""
+    logger.info("Running ratio-invariance tests")
+    
+    ratio_invariance_results = {}
+    
+    # Test parameters from config or defaults
+    alphas = config.get("eval", {}).get("ratio_invariance", {}).get("alphas", [0.1, 0.3, 0.5])
+    n_samples = config.get("eval", {}).get("ratio_invariance", {}).get("n_samples", 10)
+    
+    for parent_id, parent_vector in parent_vectors.items():
+        if parent_id not in child_deltas or len(child_deltas[parent_id]) < 2:
+            continue  # Need at least 2 children for sibling ratios
+            
+        logger.info(f"Testing ratio-invariance for parent concept: {parent_id}")
+        
+        # Get children for this parent
+        children_dict = child_deltas[parent_id]
+        child_names = list(children_dict.keys())
+        child_vectors = [children_dict[name] for name in child_names]
+        
+        # Run ratio-invariance test
+        try:
+            ri_results = test_ratio_invariance(
+                parent_vector=parent_vector,
+                child_vectors=child_vectors,
+                child_names=child_names,
+                alphas=alphas,
+                n_samples=n_samples,
+                causal_geometry=causal_geometry
+            )
+            ratio_invariance_results[parent_id] = ri_results
+            
+            # Log key metrics
+            median_kl = np.median([r['kl_divergence'] for r in ri_results.get('results', [])])
+            logger.info(f"  Median KL divergence: {median_kl:.4f}")
+            
+        except Exception as e:
+            logger.warning(f"Failed ratio-invariance test for {parent_id}: {e}")
+            ratio_invariance_results[parent_id] = {"error": str(e)}
+    
+    # Compute aggregate statistics
+    all_kls = []
+    for parent_results in ratio_invariance_results.values():
+        if 'results' in parent_results:
+            all_kls.extend([r['kl_divergence'] for r in parent_results['results']])
+    
+    aggregate_stats = {
+        "median_kl": np.median(all_kls) if all_kls else float('nan'),
+        "mean_kl": np.mean(all_kls) if all_kls else float('nan'),
+        "fraction_below_0_1": np.mean(np.array(all_kls) < 0.1) if all_kls else 0.0,
+        "fraction_below_0_2": np.mean(np.array(all_kls) < 0.2) if all_kls else 0.0,
+        "n_tests": len(all_kls)
+    }
+    
+    logger.info(f"Ratio-invariance aggregate: median KL = {aggregate_stats['median_kl']:.4f}, "
+                f"fraction < 0.1 = {aggregate_stats['fraction_below_0_1']:.3f}")
+    
+    return {
+        "by_parent": ratio_invariance_results,
+        "aggregate": aggregate_stats
+    }
+
+
 def run_euclidean_vs_causal_ablation(parent_vectors, child_deltas, config, exp_dir):
     """Run ablation comparing Euclidean vs causal geometry."""
     logger.info("Running Euclidean vs Causal ablation")
@@ -371,6 +459,14 @@ def run_euclidean_vs_causal_ablation(parent_vectors, child_deltas, config, exp_d
         f"Improvement: {geometry_comparison['improvement']['median_improvement']:.1f}°"
     )
 
+    # Run ratio-invariance tests as required by spec
+    ratio_invariance_results = run_ratio_invariance_tests(
+        parent_vectors, child_deltas, causal_geometry, config
+    )
+    
+    # Combine results
+    geometry_comparison["ratio_invariance"] = ratio_invariance_results
+
     # Save results
     geometry_file = exp_dir / "geometry_comparison.json"
     with open(geometry_file, "w") as f:
@@ -438,6 +534,12 @@ def generate_final_report(
             "causal_orthogonality_rate": geometry_comparison.get(
                 "causal_angles", {}
             ).get("fraction_above_80", 0),
+            "ratio_invariance_median_kl": geometry_comparison.get(
+                "ratio_invariance", {}
+            ).get("aggregate", {}).get("median_kl", float('nan')),
+            "ratio_invariance_fraction_below_0_1": geometry_comparison.get(
+                "ratio_invariance", {}
+            ).get("aggregate", {}).get("fraction_below_0_1", 0),
         }
 
     report["summary"] = summary
@@ -476,7 +578,13 @@ def generate_final_report(
                 f"  Causal vs Euclidean improvement: {geom['causal_vs_euclidean_improvement']:.1f}°\n"
             )
             f.write(
-                f"  Causal orthogonality rate: {geom['causal_orthogonality_rate']:.3f}\n\n"
+                f"  Causal orthogonality rate: {geom['causal_orthogonality_rate']:.3f}\n"
+            )
+            f.write(
+                f"  Ratio-invariance median KL: {geom['ratio_invariance_median_kl']:.4f}\n"
+            )
+            f.write(
+                f"  Ratio-invariance fraction < 0.1: {geom['ratio_invariance_fraction_below_0_1']:.3f}\n\n"
             )
 
         if "steering" in summary:
