@@ -5,13 +5,14 @@ This module implements standard SAEs and Hierarchical SAEs with Top-K routing,
 projectors, and teacher initialization capabilities.
 """
 
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional, Any
-import numpy as np
-import logging
-from dataclasses import dataclass
 from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SAEConfig:
     """Configuration for standard SAE."""
+
     input_dim: int
     hidden_dim: int
     l1_penalty: float = 1e-3
@@ -30,6 +32,7 @@ class SAEConfig:
 @dataclass
 class HSAEConfig:
     """Configuration for Hierarchical SAE."""
+
     input_dim: int
     n_parents: int
     topk_parent: int
@@ -44,7 +47,7 @@ class HSAEConfig:
     router_temp_end: float = 0.7
     normalize_decoder: bool = True
     top_level_beta: float = 0.1
-    
+
     # JAX-compatibility toggles
     use_tied_decoders_parent: bool = False
     use_tied_decoders_child: bool = False
@@ -56,41 +59,41 @@ class HSAEConfig:
 
 class StandardSAE(nn.Module):
     """Standard Sparse Autoencoder."""
-    
+
     def __init__(self, config: SAEConfig):
         super().__init__()
         self.config = config
-        
+
         # Encoder and decoder
         self.encoder = nn.Linear(config.input_dim, config.hidden_dim, bias=True)
-        
+
         if config.tied_weights:
             # Tied weights: decoder is transpose of encoder
             self.decoder = None
         else:
             self.decoder = nn.Linear(config.hidden_dim, config.input_dim, bias=False)
-        
+
         # Decoder bias (separate from encoder bias)
         self.decoder_bias = nn.Parameter(torch.zeros(config.input_dim))
-        
+
         self._initialize_weights()
-    
+
     def _initialize_weights(self):
         """Initialize weights."""
         # Xavier initialization for encoder
         nn.init.xavier_uniform_(self.encoder.weight)
         nn.init.zeros_(self.encoder.bias)
-        
+
         if self.decoder is not None:
             # Initialize decoder columns to unit norm
             with torch.no_grad():
                 decoder_norms = torch.norm(self.decoder.weight, dim=0, keepdim=True)
                 self.decoder.weight.div_(decoder_norms + 1e-8)
-    
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode input to sparse representation."""
         return F.relu(self.encoder(x))
-    
+
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Decode sparse representation to reconstruction."""
         if self.decoder is not None:
@@ -98,33 +101,35 @@ class StandardSAE(nn.Module):
         else:
             # Tied weights
             return F.linear(z, self.encoder.weight) + self.decoder_bias
-    
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Forward pass.
-        
+
         Args:
             x: Input tensor [batch_size, input_dim]
-            
+
         Returns:
             Tuple of (reconstruction, latent_codes, metrics)
         """
         # Encode
         z = self.encode(x)
-        
+
         # Decode
         x_hat = self.decode(z)
-        
+
         # Compute metrics
         metrics = {
-            'l1_penalty': self.config.l1_penalty * torch.mean(torch.abs(z)),
-            'reconstruction_loss': F.mse_loss(x_hat, x),
-            'sparsity': torch.mean((z > 0).float()),
-            'mean_activation': torch.mean(z),
+            "l1_penalty": self.config.l1_penalty * torch.mean(torch.abs(z)),
+            "reconstruction_loss": F.mse_loss(x_hat, x),
+            "sparsity": torch.mean((z > 0).float()),
+            "mean_activation": torch.mean(z),
         }
-        
+
         return x_hat, z, metrics
-    
+
     def normalize_decoder_weights(self):
         """Normalize decoder columns to unit norm."""
         if self.decoder is not None and self.config.normalize_decoder:
@@ -201,7 +206,9 @@ class HierarchicalSAE(nn.Module):
         self.decoder_bias = nn.Parameter(torch.zeros(config.input_dim))
 
         # Temperature for gumbel softmax (annealed during training)
-        self.register_buffer("router_temperature", torch.tensor(config.router_temp_start))
+        self.register_buffer(
+            "router_temperature", torch.tensor(config.router_temp_start)
+        )
 
         self._initialize_weights()
 
@@ -229,7 +236,7 @@ class HierarchicalSAE(nn.Module):
         codes = torch.zeros_like(logits)
         codes.scatter_(-1, topk_idx, 1.0)
         return codes
-    
+
     def _initialize_weights(self):
         """Initialize weights."""
         # Router weights
@@ -248,21 +255,23 @@ class HierarchicalSAE(nn.Module):
             with torch.no_grad():
                 child_norms = torch.norm(sub.decoder.weight, dim=0, keepdim=True)
                 sub.decoder.weight.div_(child_norms + 1e-8)
-    
-    def initialize_from_teacher(self, 
-                              parent_vectors: torch.Tensor,
-                              child_projectors: List[Tuple[torch.Tensor, torch.Tensor]],
-                              geometry=None):
+
+    def initialize_from_teacher(
+        self,
+        parent_vectors: torch.Tensor,
+        child_projectors: List[Tuple[torch.Tensor, torch.Tensor]],
+        geometry=None,
+    ):
         """
         Initialize decoder weights from teacher vectors.
-        
+
         Args:
             parent_vectors: Parent concept vectors [n_parents, input_dim]
             child_projectors: List of (down_proj, up_proj) tuples for each parent
             geometry: CausalGeometry instance for normalization
         """
         logger.info("Initializing H-SAE from teacher vectors")
-        
+
         with torch.no_grad():
             self.router.decoder.weight.copy_(parent_vectors.T)
 
@@ -282,29 +291,31 @@ class HierarchicalSAE(nn.Module):
                 nn.init.orthogonal_(sub.decoder.weight)
                 child_norms = torch.norm(sub.decoder.weight, dim=0, keepdim=True)
                 sub.decoder.weight.div_(child_norms + 1e-8)
-    
+
     def encode_parent(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encode input through parent (router) SAE.
-        
+
         Args:
             x: Input tensor [batch_size, input_dim]
-            
+
         Returns:
             Tuple of (parent_logits, parent_codes)
         """
         parent_logits = self.router.encode(x)
         parent_codes = self._sample_codes(parent_logits, self.config.topk_parent)
         return parent_logits, parent_codes
-    
-    def encode_children(self, x: torch.Tensor, parent_codes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    def encode_children(
+        self, x: torch.Tensor, parent_codes: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encode input through child SAEs for active parents.
-        
+
         Args:
             x: Input tensor [batch_size, input_dim]
             parent_codes: Parent activation codes [batch_size, n_parents]
-            
+
         Returns:
             Tuple of (child_logits, child_codes) [batch_size, n_parents, n_children_per_parent]
         """
@@ -333,15 +344,17 @@ class HierarchicalSAE(nn.Module):
             child_codes[active_mask, parent_idx] = child_codes_p
 
         return child_logits, child_codes
-    
-    def decode(self, parent_codes: torch.Tensor, child_codes: torch.Tensor) -> torch.Tensor:
+
+    def decode(
+        self, parent_codes: torch.Tensor, child_codes: torch.Tensor
+    ) -> torch.Tensor:
         """
         Decode parent and child codes to reconstruction.
-        
+
         Args:
             parent_codes: Parent activation codes [batch_size, n_parents]
             child_codes: Child activation codes [batch_size, n_parents, n_children_per_parent]
-            
+
         Returns:
             Reconstructed input [batch_size, input_dim]
         """
@@ -362,6 +375,7 @@ class HierarchicalSAE(nn.Module):
 
             child_codes_p = child_codes[active_mask, parent_idx]
             if self.config.use_gradient_checkpointing and child_codes_p.requires_grad:
+
                 def _decode(cc):
                     return sub.decode(cc, self.config.use_tied_decoders_child)
 
@@ -371,7 +385,11 @@ class HierarchicalSAE(nn.Module):
                     child_codes_p, self.config.use_tied_decoders_child
                 )
 
-            if self.config.use_gradient_checkpointing and child_recon_subspace.requires_grad:
+            if (
+                self.config.use_gradient_checkpointing
+                and child_recon_subspace.requires_grad
+            ):
+
                 def _project(u):
                     return sub.project_up(u, self.config.tie_projectors)
 
@@ -387,46 +405,54 @@ class HierarchicalSAE(nn.Module):
             reconstruction += self.decoder_bias
 
         return reconstruction
-    
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]
+    ]:
         """
         Forward pass through hierarchical SAE.
-        
+
         Args:
             x: Input tensor [batch_size, input_dim]
-            
+
         Returns:
             Tuple of (reconstruction, (parent_codes, child_codes), metrics)
         """
         # Encode through hierarchy
         parent_logits, parent_codes = self.encode_parent(x)
         child_logits, child_codes = self.encode_children(x, parent_codes)
-        
+
         # Decode
         x_hat = self.decode(parent_codes, child_codes)
-        
+
         # Compute top-level reconstruction for baseline parity
         parent_recon = self.router.decode(
             parent_codes, self.config.use_tied_decoders_parent
         )
         if self.config.use_decoder_bias:
             parent_recon += self.decoder_bias
-            
+
         # Compute metrics
         metrics = {
-            'reconstruction_loss': F.mse_loss(x_hat, x),
-            'top_level_recon_loss': F.mse_loss(parent_recon, x),
-            'l1_parent': self.config.l1_parent * torch.mean(torch.abs(parent_codes)),
-            'l1_child': self.config.l1_child * torch.mean(torch.abs(child_codes)),
-            'parent_sparsity': torch.mean((parent_codes > 0).float()),
-            'child_sparsity': torch.mean((child_codes > 0).float()),
-            'parent_usage': torch.mean(torch.sum(parent_codes > 0, dim=0).float()),
-            'child_usage': torch.mean(torch.sum(child_codes > 0, dim=(0, 1)).float()),
-            'active_parents_per_sample': torch.mean(torch.sum(parent_codes > 0, dim=1).float()),
-            'active_children_per_sample': torch.mean(torch.sum(child_codes > 0, dim=(1,2)).float()),
-            'router_temperature': self.router_temperature.item(),
+            "reconstruction_loss": F.mse_loss(x_hat, x),
+            "top_level_recon_loss": F.mse_loss(parent_recon, x),
+            "l1_parent": self.config.l1_parent * torch.mean(torch.abs(parent_codes)),
+            "l1_child": self.config.l1_child * torch.mean(torch.abs(child_codes)),
+            "parent_sparsity": torch.mean((parent_codes > 0).float()),
+            "child_sparsity": torch.mean((child_codes > 0).float()),
+            "parent_usage": torch.mean(torch.sum(parent_codes > 0, dim=0).float()),
+            "child_usage": torch.mean(torch.sum(child_codes > 0, dim=(0, 1)).float()),
+            "active_parents_per_sample": torch.mean(
+                torch.sum(parent_codes > 0, dim=1).float()
+            ),
+            "active_children_per_sample": torch.mean(
+                torch.sum(child_codes > 0, dim=(1, 2)).float()
+            ),
+            "router_temperature": self.router_temperature.item(),
         }
-        
+
         # Bi-orthogonality penalty
         if self.config.biorth_lambda > 0:
             if self.config.use_offdiag_biorth:
@@ -437,13 +463,15 @@ class HierarchicalSAE(nn.Module):
             else:
                 # Our style: E^T D ≈ I penalty
                 biorth_penalty = 0
-                
+
                 if not self.config.use_tied_decoders_parent:
-                    parent_enc_dec = self.router.encoder.weight @ self.router.decoder.weight
+                    parent_enc_dec = (
+                        self.router.encoder.weight @ self.router.decoder.weight
+                    )
                     parent_identity = torch.eye(self.config.n_parents, device=x.device)
-                    biorth_penalty += torch.norm(
-                        parent_enc_dec - parent_identity, "fro"
-                    ) ** 2
+                    biorth_penalty += (
+                        torch.norm(parent_enc_dec - parent_identity, "fro") ** 2
+                    )
 
                 if not self.config.use_tied_decoders_child:
                     for sub in self.subspaces:
@@ -451,26 +479,26 @@ class HierarchicalSAE(nn.Module):
                         child_identity = torch.eye(
                             self.config.n_children_per_parent, device=x.device
                         )
-                        biorth_penalty += torch.norm(
-                            child_enc_dec - child_identity, "fro"
-                        ) ** 2
-            
-            metrics['biorth_penalty'] = self.config.biorth_lambda * biorth_penalty
-        
+                        biorth_penalty += (
+                            torch.norm(child_enc_dec - child_identity, "fro") ** 2
+                        )
+
+            metrics["biorth_penalty"] = self.config.biorth_lambda * biorth_penalty
+
         return x_hat, (parent_codes, child_codes), metrics
-    
+
     def compute_causal_orthogonality_penalty(self, geometry) -> torch.Tensor:
         """
         Compute causal orthogonality penalty: ⟨ℓ_p, δ_{c|p}⟩_c ≈ 0.
-        
+
         Args:
             geometry: CausalGeometry instance
-            
+
         Returns:
             Orthogonality penalty scalar
         """
         penalty = 0
-        
+
         for parent_idx, sub in enumerate(self.subspaces):
             parent_vector = self.router.decoder.weight[:, parent_idx]
 
@@ -481,31 +509,38 @@ class HierarchicalSAE(nn.Module):
                         child_subspace.unsqueeze(0), sub.down_projector.weight
                     ).squeeze(0)
                 else:
-                    child_full = sub.up_projector(child_subspace.unsqueeze(0)).squeeze(0)
+                    child_full = sub.up_projector(child_subspace.unsqueeze(0)).squeeze(
+                        0
+                    )
 
                 delta = child_full - parent_vector
                 inner_prod = geometry.causal_inner_product(parent_vector, delta)
-                penalty += inner_prod ** 2
-        
+                penalty += inner_prod**2
+
         return self.config.causal_ortho_lambda * penalty
-    
+
     def normalize_decoder_weights(self):
         """Normalize decoder columns to unit norm."""
         if self.config.normalize_decoder:
             with torch.no_grad():
-                parent_norms = torch.norm(self.router.decoder.weight, dim=0, keepdim=True)
+                parent_norms = torch.norm(
+                    self.router.decoder.weight, dim=0, keepdim=True
+                )
                 self.router.decoder.weight.div_(parent_norms + 1e-8)
 
                 for sub in self.subspaces:
                     child_norms = torch.norm(sub.decoder.weight, dim=0, keepdim=True)
                     sub.decoder.weight.div_(child_norms + 1e-8)
-    
+
     def update_router_temperature(self, step: int, total_steps: int):
         """Update router temperature according to schedule."""
         progress = step / total_steps
-        temp = self.config.router_temp_start * (1 - progress) + self.config.router_temp_end * progress
+        temp = (
+            self.config.router_temp_start * (1 - progress)
+            + self.config.router_temp_end * progress
+        )
         self.router_temperature.fill_(temp)
-    
+
     def _biorth_penalty_parent_offdiag(self) -> torch.Tensor:
         """JAX-style off-diagonal cross-orthogonality penalty for parent."""
         E = F.normalize(self.router.encoder.weight, dim=1)  # [P, d]
@@ -516,7 +551,7 @@ class HierarchicalSAE(nn.Module):
         M = E @ D.t()  # [P, P]
         off = M - torch.diag(torch.diag(M))
         return off.pow(2).sum() / (M.numel() - M.shape[0])
-    
+
     def _biorth_penalty_child_offdiag(self, parent_idx: int) -> torch.Tensor:
         """JAX-style off-diagonal cross-orthogonality penalty for child."""
         sub = self.subspaces[parent_idx]
@@ -535,10 +570,12 @@ def create_baseline_hsae(config: HSAEConfig) -> HierarchicalSAE:
     return HierarchicalSAE(config)
 
 
-def create_teacher_initialized_hsae(config: HSAEConfig,
-                                  parent_vectors: torch.Tensor,
-                                  child_projectors: List[Tuple[torch.Tensor, torch.Tensor]],
-                                  geometry=None) -> HierarchicalSAE:
+def create_teacher_initialized_hsae(
+    config: HSAEConfig,
+    parent_vectors: torch.Tensor,
+    child_projectors: List[Tuple[torch.Tensor, torch.Tensor]],
+    geometry=None,
+) -> HierarchicalSAE:
     """Create teacher-initialized H-SAE."""
     hsae = HierarchicalSAE(config)
     hsae.initialize_from_teacher(parent_vectors, child_projectors, geometry)

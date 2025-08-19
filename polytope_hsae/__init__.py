@@ -8,15 +8,9 @@ concepts in LLMs and incorporating that structure into Hierarchical Sparse Autoe
 __version__ = "1.0.0"
 __author__ = "Research Team"
 
-from . import geometry
-from . import estimators
-from . import validation
-from . import concepts
-from . import activations
-from . import models
-from . import training
-from . import steering
-from . import metrics
+from . import (activations, concepts, estimators, geometry, metrics, models,
+               steering, training, validation)
+
 # from . import visualization  # Module not yet implemented
 
 __all__ = [

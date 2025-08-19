@@ -5,18 +5,19 @@ This module handles efficient capture of residual stream activations from
 transformer models for the polytope discovery experiments.
 """
 
+import logging
+import multiprocessing as mp
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import h5py
+import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer
-from typing import Dict, List, Tuple, Any, Optional, Callable
-import numpy as np
-from pathlib import Path
-import h5py
-import logging
-from tqdm import tqdm
-from dataclasses import dataclass
 from nltk.corpus import wordnet as wn
-import multiprocessing as mp
+from tqdm import tqdm
+from transformers import AutoModel, AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ActivationConfig:
     """Configuration for activation capture."""
+
     model_name: str
     layer_name: str  # e.g., "final_residual_pre_unembed"
     batch_size: int = 32
@@ -36,7 +38,9 @@ class ActivationConfig:
 class ActivationCapture:
     """Captures activations from transformer models."""
 
-    def __init__(self, config: ActivationConfig, negative_corpus: Optional[List[str]] = None):
+    def __init__(
+        self, config: ActivationConfig, negative_corpus: Optional[List[str]] = None
+    ):
         """Initialize activation capture.
 
         Args:
@@ -49,36 +53,39 @@ class ActivationCapture:
         self.config = config
         self.device = torch.device(config.device)
         self.negative_corpus = negative_corpus
-        
+
         # Use AutoModelForCausalLM when available to ensure consistent heads;
         # fall back to AutoModel if necessary.
         logger.info(f"Loading model {config.model_name}")
         try:
             from transformers import AutoModelForCausalLM
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 config.model_name,
                 torch_dtype=config.dtype,
-                device_map="auto" if "cuda" in config.device else None
+                device_map="auto" if "cuda" in config.device else None,
             )
         except Exception:
             self.model = AutoModel.from_pretrained(
                 config.model_name,
                 torch_dtype=config.dtype,
-                device_map="auto" if "cuda" in config.device else None
+                device_map="auto" if "cuda" in config.device else None,
             )
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-        
+
         # Add padding token if missing
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            
+
         self.model.eval()
-        
+
         # Find target layer (or plan B: capture last_hidden_state directly)
         self.target_layer = None
         try:
             if self.config.hook_layer_path:
-                self.target_layer = self._get_module_by_path(self.config.hook_layer_path)
+                self.target_layer = self._get_module_by_path(
+                    self.config.hook_layer_path
+                )
             else:
                 self.target_layer = self._find_target_layer()
             logger.info(f"Target layer: {self.target_layer}")
@@ -86,11 +93,11 @@ class ActivationCapture:
             logger.warning(
                 "Falling back to capturing last_hidden_state (no explicit hook layer found)."
             )
-        
+
         # Storage for captured activations
         self.captured_activations = []
         self.hook_handle = None
-    
+
     def _find_target_layer(self) -> torch.nn.Module:
         """Find the target layer for activation capture.
 
@@ -105,9 +112,7 @@ class ActivationCapture:
         if "final" in layer_name and "residual" in layer_name:
             # Look for final layer normalization or similar
             for name, module in self.model.named_modules():
-                if (
-                    "final" in name.lower() or "last" in name.lower()
-                ) and (
+                if ("final" in name.lower() or "last" in name.lower()) and (
                     "norm" in name.lower() or "layer_norm" in name.lower()
                 ):
                     return module
@@ -117,7 +122,9 @@ class ActivationCapture:
                 return self.model.layers[-1]
             if hasattr(self.model, "h"):  # GPT-style
                 return self.model.h[-1]
-            if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
+            if hasattr(self.model, "transformer") and hasattr(
+                self.model.transformer, "h"
+            ):
                 return self.model.transformer.h[-1]
 
         # For specific layer names, search directly
@@ -133,24 +140,24 @@ class ActivationCapture:
         for attr in path.split("."):
             module = getattr(module, attr)
         return module
-    
+
     def _activation_hook(self, module, input, output):
         """Hook function to capture activations."""
         if isinstance(output, tuple):
             activation = output[0]  # Usually the first element is the main output
         else:
             activation = output
-            
+
         # Store activation (detached to avoid gradients)
         self.captured_activations.append(activation.detach().cpu())
-    
+
     def capture_batch_activations(self, prompts: List[str]) -> torch.Tensor:
         """
         Capture activations for a batch of prompts.
-        
+
         Args:
             prompts: List of text prompts
-            
+
         Returns:
             Tensor of activations [batch_size, seq_len, hidden_dim]
         """
@@ -160,16 +167,18 @@ class ActivationCapture:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=self.config.max_length
+            max_length=self.config.max_length,
         ).to(self.device)
-        
+
         # Clear previous captures
         self.captured_activations = []
-        
+
         # Register hook if we have a target layer; else run once and grab last_hidden_state
         if self.target_layer is not None:
-            self.hook_handle = self.target_layer.register_forward_hook(self._activation_hook)
-        
+            self.hook_handle = self.target_layer.register_forward_hook(
+                self._activation_hook
+            )
+
         try:
             with torch.no_grad():
                 outputs = self.model(**inputs)
@@ -180,20 +189,20 @@ class ActivationCapture:
             if hasattr(outputs, "last_hidden_state"):
                 return outputs.last_hidden_state.detach().cpu()
             raise RuntimeError("No activations were captured")
-                
+
         finally:
             # Clean up hook
             if self.hook_handle:
                 self.hook_handle.remove()
                 self.hook_handle = None
-    
+
     def capture_last_token_activations(self, prompts: List[str]) -> torch.Tensor:
         """
         Capture activations for the last token of each prompt.
-        
+
         Args:
             prompts: List of text prompts
-            
+
         Returns:
             Tensor of last-token activations [batch_size, hidden_dim]
         """
@@ -203,97 +212,107 @@ class ActivationCapture:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=self.config.max_length
+            max_length=self.config.max_length,
         )
-        
+
         # Get sequence lengths (last non-padding token)
-        attention_mask = inputs['attention_mask']
+        attention_mask = inputs["attention_mask"]
         seq_lengths = attention_mask.sum(dim=1) - 1  # -1 for 0-indexing
-        
+
         # Capture full activations
-        full_activations = self.capture_batch_activations(prompts)  # [batch, seq, hidden]
-        
+        full_activations = self.capture_batch_activations(
+            prompts
+        )  # [batch, seq, hidden]
+
         # Extract last token activations
         batch_size = full_activations.shape[0]
         hidden_dim = full_activations.shape[2]
         last_token_activations = torch.zeros(batch_size, hidden_dim)
-        
+
         for i in range(batch_size):
             last_pos = seq_lengths[i].item()
             last_token_activations[i] = full_activations[i, last_pos]
-        
+
         return last_token_activations
-    
-    def capture_concept_activations(self, 
-                                  concept_prompts: Dict[str, List[str]],
-                                  save_path: Optional[str] = None) -> Dict[str, torch.Tensor]:
+
+    def capture_concept_activations(
+        self, concept_prompts: Dict[str, List[str]], save_path: Optional[str] = None
+    ) -> Dict[str, torch.Tensor]:
         """
         Capture activations for multiple concepts.
-        
+
         Args:
             concept_prompts: Dict mapping concept_id -> list of prompts
             save_path: Optional path to save activations
-            
+
         Returns:
             Dict mapping concept_id -> activation tensor
         """
         logger.info(f"Capturing activations for {len(concept_prompts)} concepts")
-        
+
         concept_activations = {}
-        
-        for concept_id, prompts in tqdm(concept_prompts.items(), desc="Capturing activations"):
+
+        for concept_id, prompts in tqdm(
+            concept_prompts.items(), desc="Capturing activations"
+        ):
             # Process in batches
             all_activations = []
-            
+
             for i in range(0, len(prompts), self.config.batch_size):
-                batch_prompts = prompts[i:i + self.config.batch_size]
+                batch_prompts = prompts[i : i + self.config.batch_size]
                 batch_activations = self.capture_last_token_activations(batch_prompts)
                 all_activations.append(batch_activations)
-            
+
             # Concatenate all batches
             concept_activations[concept_id] = torch.cat(all_activations, dim=0)
-            
-            logger.debug(f"Captured {concept_activations[concept_id].shape[0]} activations for {concept_id}")
-        
+
+            logger.debug(
+                f"Captured {concept_activations[concept_id].shape[0]} activations for {concept_id}"
+            )
+
         # Save if requested
         if save_path:
             self.save_activations(concept_activations, save_path)
-        
+
         return concept_activations
-    
-    def capture_hierarchical_activations(self,
-                                       hierarchies,
-                                       negative_sampling_ratio: float = 1.0,
-                                       save_path: Optional[str] = None) -> Dict[str, Dict[str, torch.Tensor]]:
+
+    def capture_hierarchical_activations(
+        self,
+        hierarchies,
+        negative_sampling_ratio: float = 1.0,
+        save_path: Optional[str] = None,
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
         """
         Capture activations for hierarchical concepts with positive/negative examples.
-        
+
         Args:
             hierarchies: List of ConceptHierarchy objects
             negative_sampling_ratio: Ratio of negative to positive examples
             save_path: Optional path to save activations
-            
+
         Returns:
             Nested dict: concept_id -> {'pos': tensor, 'neg': tensor}
         """
-        logger.info(f"Capturing hierarchical activations for {len(hierarchies)} hierarchies")
-        
+        logger.info(
+            f"Capturing hierarchical activations for {len(hierarchies)} hierarchies"
+        )
+
         all_activations = {}
-        
+
         for hierarchy in tqdm(hierarchies, desc="Processing hierarchies"):
             parent_id = hierarchy.parent.synset_id
-            
+
             # Capture parent activations
             parent_pos_prompts = hierarchy.parent_prompts
             parent_neg_prompts = self._generate_negative_prompts(
                 parent_pos_prompts, negative_sampling_ratio
             )
-            
+
             all_activations[parent_id] = {
-                'pos': self._capture_prompts_in_batches(parent_pos_prompts),
-                'neg': self._capture_prompts_in_batches(parent_neg_prompts)
+                "pos": self._capture_prompts_in_batches(parent_pos_prompts),
+                "neg": self._capture_prompts_in_batches(parent_neg_prompts),
             }
-            
+
             # Capture child activations
             for child in hierarchy.children:
                 child_id = child.synset_id
@@ -301,18 +320,18 @@ class ActivationCapture:
                 child_neg_prompts = self._generate_negative_prompts(
                     child_pos_prompts, negative_sampling_ratio
                 )
-                
+
                 all_activations[child_id] = {
-                    'pos': self._capture_prompts_in_batches(child_pos_prompts),
-                    'neg': self._capture_prompts_in_batches(child_neg_prompts)
+                    "pos": self._capture_prompts_in_batches(child_pos_prompts),
+                    "neg": self._capture_prompts_in_batches(child_neg_prompts),
                 }
-        
+
         # Save if requested
         if save_path:
             self.save_hierarchical_activations(all_activations, save_path)
-        
+
         return all_activations
-    
+
     def _capture_prompts_in_batches(self, prompts: List[str]) -> torch.Tensor:
         """Capture activations for prompts in batches."""
         all_activations = []
@@ -334,7 +353,7 @@ class ActivationCapture:
             "This is not about",
             "This has nothing to do with",
             "This is unrelated to",
-            "This is the opposite of",
+            "This is the opposite o",
             "This contradicts",
         ]
 
@@ -443,7 +462,9 @@ class ActivationCapture:
         )
         return activations
 
-    def load_hierarchical_activations(self, filepath: str) -> Dict[str, Dict[str, torch.Tensor]]:
+    def load_hierarchical_activations(
+        self, filepath: str
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
         """Load hierarchical activations from HDF5 file."""
         activations: Dict[str, Dict[str, torch.Tensor]] = {}
 
@@ -462,54 +483,58 @@ class ActivationCapture:
         return activations
 
 
-def create_activation_shards(activations: Dict[str, torch.Tensor],
-                           shard_size: int = 1000,
-                           output_dir: str = "activation_shards") -> List[str]:
+def create_activation_shards(
+    activations: Dict[str, torch.Tensor],
+    shard_size: int = 1000,
+    output_dir: str = "activation_shards",
+) -> List[str]:
     """
     Create sharded activation files for efficient loading.
-    
+
     Args:
         activations: Dictionary of concept activations
         shard_size: Number of samples per shard
         output_dir: Directory to save shards
-        
+
     Returns:
         List of shard file paths
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     shard_files = []
-    
+
     # Combine all activations
     all_concept_ids = []
     all_activations = []
-    
+
     for concept_id, activation_tensor in activations.items():
         n_samples = activation_tensor.shape[0]
         all_concept_ids.extend([concept_id] * n_samples)
         all_activations.append(activation_tensor)
-    
+
     all_activations = torch.cat(all_activations, dim=0)
-    
+
     # Create shards
     n_samples = len(all_activations)
     n_shards = (n_samples + shard_size - 1) // shard_size
-    
+
     for shard_idx in range(n_shards):
         start_idx = shard_idx * shard_size
         end_idx = min((shard_idx + 1) * shard_size, n_samples)
-        
+
         shard_activations = all_activations[start_idx:end_idx]
         shard_concept_ids = all_concept_ids[start_idx:end_idx]
-        
+
         shard_path = output_path / f"shard_{shard_idx:04d}.h5"
-        
-        with h5py.File(shard_path, 'w') as f:
-            f.create_dataset('activations', data=shard_activations.numpy())
-            f.create_dataset('concept_ids', data=[s.encode('utf-8') for s in shard_concept_ids])
-        
+
+        with h5py.File(shard_path, "w") as f:
+            f.create_dataset("activations", data=shard_activations.numpy())
+            f.create_dataset(
+                "concept_ids", data=[s.encode("utf-8") for s in shard_concept_ids]
+            )
+
         shard_files.append(str(shard_path))
-    
+
     logger.info(f"Created {n_shards} activation shards in {output_dir}")
     return shard_files

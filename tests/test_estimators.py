@@ -1,15 +1,13 @@
-import torch
-import sys
 import pathlib
+import sys
+
+import torch
+
+from polytope_hsae.estimators import (LDAEstimator, OrthogonalityStats,
+                                      validate_orthogonality)
+from polytope_hsae.geometry import CausalGeometry
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
-
-from polytope_hsae.estimators import (
-    LDAEstimator,
-    validate_orthogonality,
-    OrthogonalityStats,
-)
-from polytope_hsae.geometry import CausalGeometry
 
 
 def test_lda_estimator_outputs_direction_with_correct_shape():
@@ -44,4 +42,3 @@ def test_validate_orthogonality_detects_orthogonal_and_nonorthogonal():
     stats_non = validate_orthogonality(parent_vectors, child_non, geom)
     assert stats_non.fraction_orthogonal_80deg == 0.0
     assert stats_non.mean_inner_product > 0.1
-

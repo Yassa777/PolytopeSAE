@@ -1,15 +1,11 @@
+import pathlib
 import random
 import sys
-import pathlib
+
+from polytope_hsae.concepts import (ConceptHierarchy, ConceptInfo,
+                                    ConceptSplitter, PromptGenerator)
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
-
-from polytope_hsae.concepts import (
-    ConceptInfo,
-    ConceptHierarchy,
-    PromptGenerator,
-    ConceptSplitter,
-)
 
 
 def _dummy_concept(idx: int) -> ConceptInfo:
@@ -26,7 +22,9 @@ def _dummy_concept(idx: int) -> ConceptInfo:
 def _dummy_hierarchy(idx: int) -> ConceptHierarchy:
     parent = _dummy_concept(idx)
     child = _dummy_concept(idx + 1000)
-    return ConceptHierarchy(parent=parent, children=[child], parent_prompts=[], child_prompts={})
+    return ConceptHierarchy(
+        parent=parent, children=[child], parent_prompts=[], child_prompts={}
+    )
 
 
 def test_prompt_generator_count():
@@ -51,5 +49,3 @@ def test_concept_splitter_ratios():
     assert len(prompt_splits["train"]) == 14
     assert len(prompt_splits["val"]) == 3
     assert len(prompt_splits["test"]) == 3
-
-
