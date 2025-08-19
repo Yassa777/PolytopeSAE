@@ -1,6 +1,14 @@
 import torch
+import sys
+import pathlib
 
-from polytope_hsae.estimators import LDAEstimator, validate_orthogonality
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
+
+from polytope_hsae.estimators import (
+    LDAEstimator,
+    validate_orthogonality,
+    OrthogonalityStats,
+)
 from polytope_hsae.geometry import CausalGeometry
 
 
@@ -30,8 +38,10 @@ def test_validate_orthogonality_detects_orthogonal_and_nonorthogonal():
     child_orth = {"p": {"c1": delta_ortho}}
     child_non = {"p": {"c1": delta_non}}
     stats_orth = validate_orthogonality(parent_vectors, child_orth, geom)
-    assert stats_orth["fraction_orthogonal_80deg"] == 1.0
-    assert abs(stats_orth["mean_inner_product"]) < 1e-5
+    assert isinstance(stats_orth, OrthogonalityStats)
+    assert stats_orth.fraction_orthogonal_80deg == 1.0
+    assert abs(stats_orth.mean_inner_product) < 1e-5
     stats_non = validate_orthogonality(parent_vectors, child_non, geom)
-    assert stats_non["fraction_orthogonal_80deg"] == 0.0
-    assert stats_non["mean_inner_product"] > 0.1
+    assert stats_non.fraction_orthogonal_80deg == 0.0
+    assert stats_non.mean_inner_product > 0.1
+

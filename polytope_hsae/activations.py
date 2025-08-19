@@ -15,6 +15,8 @@ import h5py
 import logging
 from tqdm import tqdm
 from dataclasses import dataclass
+from nltk.corpus import wordnet as wn
+import multiprocessing as mp
 
 logger = logging.getLogger(__name__)
 
@@ -28,20 +30,25 @@ class ActivationConfig:
     max_length: int = 128
     device: str = "cuda:0"
     dtype: torch.dtype = torch.bfloat16
+    hook_layer_path: Optional[str] = None  # explicit dotted path for hook layer
 
 
 class ActivationCapture:
     """Captures activations from transformer models."""
-    
-    def __init__(self, config: ActivationConfig):
-        """
-        Initialize activation capture.
-        
+
+    def __init__(self, config: ActivationConfig, negative_corpus: Optional[List[str]] = None):
+        """Initialize activation capture.
+
         Args:
-            config: ActivationConfig object
+            config: ActivationConfig object.
+            negative_corpus: Optional external corpus of prompts to use when
+                sampling negatives. When provided, random samples from this
+                corpus are mixed into the automatically generated negatives
+                to improve contrast quality.
         """
         self.config = config
         self.device = torch.device(config.device)
+        self.negative_corpus = negative_corpus
         
         # Use AutoModelForCausalLM when available to ensure consistent heads;
         # fall back to AutoModel if necessary.
@@ -70,41 +77,62 @@ class ActivationCapture:
         # Find target layer (or plan B: capture last_hidden_state directly)
         self.target_layer = None
         try:
-            self.target_layer = self._find_target_layer()
+            if self.config.hook_layer_path:
+                self.target_layer = self._get_module_by_path(self.config.hook_layer_path)
+            else:
+                self.target_layer = self._find_target_layer()
             logger.info(f"Target layer: {self.target_layer}")
         except Exception:
-            logger.warning("Falling back to capturing last_hidden_state (no explicit hook layer found).")
+            logger.warning(
+                "Falling back to capturing last_hidden_state (no explicit hook layer found)."
+            )
         
         # Storage for captured activations
         self.captured_activations = []
         self.hook_handle = None
     
     def _find_target_layer(self) -> torch.nn.Module:
-        """Find the target layer for activation capture."""
+        """Find the target layer for activation capture.
+
+        This method falls back to simple string heuristics if no explicit
+        ``hook_layer_path`` is provided in :class:`ActivationConfig`. Users
+        working with bespoke model architectures are encouraged to supply the
+        exact module path via ``hook_layer_path`` for reliability.
+        """
         layer_name = self.config.layer_name.lower()
-        
+
         # Common layer patterns
         if "final" in layer_name and "residual" in layer_name:
             # Look for final layer normalization or similar
             for name, module in self.model.named_modules():
-                if ("final" in name.lower() or "last" in name.lower()) and \
-                   ("norm" in name.lower() or "layer_norm" in name.lower()):
+                if (
+                    "final" in name.lower() or "last" in name.lower()
+                ) and (
+                    "norm" in name.lower() or "layer_norm" in name.lower()
+                ):
                     return module
-            
+
             # Fallback: use the last transformer layer
-            if hasattr(self.model, 'layers'):
+            if hasattr(self.model, "layers"):
                 return self.model.layers[-1]
-            elif hasattr(self.model, 'h'):  # GPT-style
+            if hasattr(self.model, "h"):  # GPT-style
                 return self.model.h[-1]
-            elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+            if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
                 return self.model.transformer.h[-1]
-        
+
         # For specific layer names, search directly
         for name, module in self.model.named_modules():
             if layer_name in name.lower():
                 return module
-        
+
         raise ValueError(f"Could not find target layer: {self.config.layer_name}")
+
+    def _get_module_by_path(self, path: str) -> torch.nn.Module:
+        """Retrieve a module from the model via a dotted path."""
+        module: torch.nn.Module = self.model
+        for attr in path.split("."):
+            module = getattr(module, attr)
+        return module
     
     def _activation_hook(self, module, input, output):
         """Hook function to capture activations."""
@@ -288,19 +316,20 @@ class ActivationCapture:
     def _capture_prompts_in_batches(self, prompts: List[str]) -> torch.Tensor:
         """Capture activations for prompts in batches."""
         all_activations = []
-        
+
         for i in range(0, len(prompts), self.config.batch_size):
-            batch_prompts = prompts[i:i + self.config.batch_size]
+            batch_prompts = prompts[i : i + self.config.batch_size]
             batch_activations = self.capture_last_token_activations(batch_prompts)
             all_activations.append(batch_activations)
-        
+
         return torch.cat(all_activations, dim=0)
-    
-    def _generate_negative_prompts(self, positive_prompts: List[str], ratio: float) -> List[str]:
-        """Generate negative prompts by simple negation and random sampling."""
-        negative_prompts = []
-        
-        # Simple negation strategy
+
+    def _generate_negative_prompts(
+        self, positive_prompts: List[str], ratio: float
+    ) -> List[str]:
+        """Generate negative prompts using antonyms or external corpora."""
+
+        negative_prompts: List[str] = []
         negation_prefixes = [
             "This is not about",
             "This has nothing to do with",
@@ -308,65 +337,128 @@ class ActivationCapture:
             "This is the opposite of",
             "This contradicts",
         ]
-        
+
+        max_negatives = int(len(positive_prompts) * ratio)
+
         for prompt in positive_prompts:
-            if len(negative_prompts) >= len(positive_prompts) * ratio:
+            if len(negative_prompts) >= max_negatives:
                 break
-                
-            # Add negation
+
+            tokens = prompt.split()
+            replaced = False
+            for token in tokens:
+                synsets = wn.synsets(token)
+                for syn in synsets:
+                    for lemma in syn.lemmas():
+                        if lemma.antonyms():
+                            antonym = lemma.antonyms()[0].name().replace("_", " ")
+                            negative_prompts.append(prompt.replace(token, antonym))
+                            replaced = True
+                            break
+                    if replaced:
+                        break
+                if replaced:
+                    break
+
+            if replaced:
+                continue
+
+            if self.negative_corpus:
+                negative_prompts.append(np.random.choice(self.negative_corpus))
+                continue
+
             prefix = np.random.choice(negation_prefixes)
-            negative_prompt = f"{prefix} {prompt.lower()}"
-            negative_prompts.append(negative_prompt)
-        
+            negative_prompts.append(f"{prefix} {prompt.lower()}")
+
         return negative_prompts
-    
-    def save_activations(self, activations: Dict[str, torch.Tensor], filepath: str):
-        """Save activations to HDF5 file."""
-        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        
-        with h5py.File(filepath, 'w') as f:
-            for concept_id, activation_tensor in activations.items():
-                f.create_dataset(concept_id, data=activation_tensor.to(torch.float32).numpy())
-        
-        logger.info(f"Saved activations for {len(activations)} concepts to {filepath}")
-    
-    def save_hierarchical_activations(self, 
-                                    activations: Dict[str, Dict[str, torch.Tensor]], 
-                                    filepath: str):
+
+    def save_activations(
+        self,
+        activations: Dict[str, torch.Tensor],
+        filepath: str,
+        use_async: bool = False,
+    ) -> Optional[mp.Process]:
+        """Save activations to HDF5 file.
+
+        When ``use_async`` is True, the save operation is executed in a
+        separate process and the handle is returned.
+        """
+
+        def _save() -> None:
+            Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+            with h5py.File(filepath, "w") as f:
+                for concept_id, activation_tensor in activations.items():
+                    f.create_dataset(
+                        concept_id, data=activation_tensor.to(torch.float32).numpy()
+                    )
+            logger.info(
+                f"Saved activations for {len(activations)} concepts to {filepath}"
+            )
+
+        if use_async:
+            proc = mp.Process(target=_save)
+            proc.start()
+            return proc
+        _save()
+        return None
+
+    def save_hierarchical_activations(
+        self,
+        activations: Dict[str, Dict[str, torch.Tensor]],
+        filepath: str,
+        use_async: bool = False,
+    ) -> Optional[mp.Process]:
         """Save hierarchical activations to HDF5 file."""
-        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        
-        with h5py.File(filepath, 'w') as f:
-            for concept_id, pos_neg_dict in activations.items():
-                concept_group = f.create_group(concept_id)
-                for pos_neg, activation_tensor in pos_neg_dict.items():
-                    concept_group.create_dataset(pos_neg, data=activation_tensor.to(torch.float32).numpy())
-        
-        logger.info(f"Saved hierarchical activations for {len(activations)} concepts to {filepath}")
-    
+
+        def _save() -> None:
+            Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+            with h5py.File(filepath, "w") as f:
+                for concept_id, pos_neg_dict in activations.items():
+                    concept_group = f.create_group(concept_id)
+                    for pos_neg, activation_tensor in pos_neg_dict.items():
+                        concept_group.create_dataset(
+                            pos_neg, data=activation_tensor.to(torch.float32).numpy()
+                        )
+            logger.info(
+                f"Saved hierarchical activations for {len(activations)} concepts to {filepath}"
+            )
+
+        if use_async:
+            proc = mp.Process(target=_save)
+            proc.start()
+            return proc
+        _save()
+        return None
+
     def load_activations(self, filepath: str) -> Dict[str, torch.Tensor]:
         """Load activations from HDF5 file."""
-        activations = {}
-        
-        with h5py.File(filepath, 'r') as f:
+        activations: Dict[str, torch.Tensor] = {}
+
+        with h5py.File(filepath, "r") as f:
             for concept_id in f.keys():
                 activations[concept_id] = torch.from_numpy(f[concept_id][:])
-        
-        logger.info(f"Loaded activations for {len(activations)} concepts from {filepath}")
+
+        logger.info(
+            f"Loaded activations for {len(activations)} concepts from {filepath}"
+        )
         return activations
-    
+
     def load_hierarchical_activations(self, filepath: str) -> Dict[str, Dict[str, torch.Tensor]]:
         """Load hierarchical activations from HDF5 file."""
-        activations = {}
-        
-        with h5py.File(filepath, 'r') as f:
+        activations: Dict[str, Dict[str, torch.Tensor]] = {}
+
+        with h5py.File(filepath, "r") as f:
             for concept_id in f.keys():
                 concept_group = f[concept_id]
                 activations[concept_id] = {}
                 for pos_neg in concept_group.keys():
-                    activations[concept_id][pos_neg] = torch.from_numpy(concept_group[pos_neg][:])
-        
-        logger.info(f"Loaded hierarchical activations for {len(activations)} concepts from {filepath}")
+                    activations[concept_id][pos_neg] = torch.from_numpy(
+                        concept_group[pos_neg][:]
+                    )
+
+        logger.info(
+            f"Loaded hierarchical activations for {len(activations)} concepts from {filepath}"
+        )
         return activations
 
 
