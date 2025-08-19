@@ -83,7 +83,7 @@ class HSAETrainer:
         # Training state
         self.step = 0
         self.epoch = 0
-        self.best_val_loss = float("in")
+        self.best_val_loss = float("inf")
 
         # Logging
         self.log_dir = Path(config["logging"]["save_dir"])
