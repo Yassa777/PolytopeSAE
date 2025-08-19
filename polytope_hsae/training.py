@@ -12,7 +12,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from typing import Dict, List, Tuple, Optional, Any
 import logging
 from tqdm import tqdm
-import wandb
+try:
+    import wandb  # type: ignore
+except Exception:  # pragma: no cover
+    wandb = None
 from pathlib import Path
 import json
 from datetime import datetime
@@ -43,7 +46,7 @@ class HSAETrainer:
         self.model = model
         self.config = config
         self.geometry = geometry
-        self.use_wandb = use_wandb
+        self.use_wandb = use_wandb and wandb is not None
         
         # Setup optimizer
         self.optimizer = AdamW(
@@ -94,71 +97,32 @@ class HSAETrainer:
         """
         self.model.train()
         self.optimizer.zero_grad()
-        
-        # Unit normalize inputs if specified
-        if self.config.get('data', {}).get('unit_norm', False):
-            batch = F.normalize(batch, dim=-1)
-        
-        # Forward pass
+
+        batch = self._normalize_batch(batch)
+
         x_hat, (parent_codes, child_codes), metrics = self.model(batch)
-        
-        # Compute losses
-        recon_loss = metrics['reconstruction_loss']
-        l1_loss = metrics['l1_parent'] + metrics['l1_child']
-        
-        # Top-level reconstruction loss (for baseline parity)
-        top_level_loss = 0.0
-        if hasattr(self.model.config, 'top_level_beta') and self.model.config.top_level_beta > 0:
-            top_level_loss = self.model.config.top_level_beta * metrics['top_level_recon_loss']
-        
-        # Bi-orthogonality loss
-        biorth_loss = metrics.get('biorth_penalty', 0.0)
-        
-        # Causal orthogonality loss (only in stabilize stage for teacher-init)
-        causal_ortho_loss = 0.0
-        if (stage == "stabilize" and 
-            hasattr(self.model.config, 'causal_ortho_lambda') and 
-            self.model.config.causal_ortho_lambda > 0 and 
-            self.geometry is not None):
-            # Ensure geometry is on the same device as model
-            self.geometry.to(str(batch.device))
-            causal_ortho_loss = self.model.compute_causal_orthogonality_penalty(self.geometry)
-        
-        # Total loss
-        total_loss = recon_loss + l1_loss + top_level_loss + biorth_loss + causal_ortho_loss
-        
-        # Backward pass
-        total_loss.backward()
-        
-        # Gradient clipping
-        if 'grad_clip' in self.config['training']:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), 
-                self.config['training']['grad_clip']
-            )
-        
-        # Optimizer step
-        self.optimizer.step()
-        
-        # Update router temperature
+
+        (
+            total_loss,
+            recon_loss,
+            l1_loss,
+            top_level_loss,
+            biorth_loss,
+            causal_ortho_loss,
+        ) = self._compute_total_loss(batch, x_hat, metrics, stage)
+
+        self._optimizer_step(total_loss)
+
         total_steps = self.config['training'].get('total_steps', 10000)
         self.model.update_router_temperature(self.step, total_steps)
-        
-        # Normalize decoder weights
         self.model.normalize_decoder_weights()
-        
-        # Update scheduler
-        if self.scheduler is not None:
-            self.scheduler.step()
-        
+
         self.step += 1
-        
-        # Compute additional metrics
+
         with torch.no_grad():
             ev = compute_explained_variance(batch, x_hat)
             ce_proxy = compute_cross_entropy_proxy(batch, x_hat)
-        
-        # Return metrics
+
         return {
             'total_loss': total_loss.item(),
             'recon_loss': recon_loss.item(),
@@ -175,6 +139,102 @@ class HSAETrainer:
             'router_temperature': metrics['router_temperature'],
             'lr': self.optimizer.param_groups[0]['lr'],
         }
+
+    def _normalize_batch(self, batch: torch.Tensor) -> torch.Tensor:
+        if self.config.get('data', {}).get('unit_norm', False):
+            batch = F.normalize(batch, dim=-1)
+        return batch
+
+    def _compute_total_loss(
+        self,
+        batch: torch.Tensor,
+        x_hat: torch.Tensor,
+        metrics: Dict[str, torch.Tensor],
+        stage: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, torch.Tensor, torch.Tensor]:
+        recon_loss = metrics['reconstruction_loss']
+        l1_loss = metrics['l1_parent'] + metrics['l1_child']
+        top_level_loss = 0.0
+        if hasattr(self.model.config, 'top_level_beta') and self.model.config.top_level_beta > 0:
+            top_level_loss = self.model.config.top_level_beta * metrics['top_level_recon_loss']
+        biorth_loss = metrics.get('biorth_penalty', 0.0)
+        causal_ortho_loss = 0.0
+        if (
+            stage == 'stabilize'
+            and hasattr(self.model.config, 'causal_ortho_lambda')
+            and self.model.config.causal_ortho_lambda > 0
+            and self.geometry is not None
+        ):
+            self.geometry.to(str(batch.device))
+            causal_ortho_loss = self.model.compute_causal_orthogonality_penalty(self.geometry)
+        total_loss = recon_loss + l1_loss + top_level_loss + biorth_loss + causal_ortho_loss
+        return total_loss, recon_loss, l1_loss, top_level_loss, biorth_loss, causal_ortho_loss
+
+    def _optimizer_step(self, total_loss: torch.Tensor):
+        total_loss.backward()
+        if 'grad_clip' in self.config['training']:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.config['training']['grad_clip']
+            )
+        self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
+
+    def _run_stage(
+        self,
+        train_iter,
+        train_loader,
+        val_loader,
+        steps: int,
+        stage: str,
+        history: Dict[str, List[float]],
+        start_step: int = 0,
+        desc: Optional[str] = None,
+    ):
+        pbar = tqdm(range(steps), desc=desc or stage)
+        for step in pbar:
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
+
+            if isinstance(batch, (list, tuple)):
+                batch = batch[0]
+            batch = batch.to(next(self.model.parameters()).device)
+
+            metrics = self.train_step(batch, stage=stage)
+
+            pbar.set_postfix(
+                {
+                    'Loss': f"{metrics['total_loss']:.4f}",
+                    '1-EV': f"{metrics['1-EV']:.4f}",
+                }
+            )
+
+            global_step = start_step + step
+            if step % self.config['logging']['log_every'] == 0:
+                history['train_loss'].append(metrics['total_loss'])
+                history['step'].append(global_step)
+                if 'stage' in history:
+                    history['stage'].append(stage)
+                if self.use_wandb:
+                    wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=global_step)
+                    if stage != 'main':
+                        wandb.log({'stage': stage}, step=global_step)
+                if val_loader is not None:
+                    val_metrics = self.validate(val_loader)
+                    history['val_loss'].append(val_metrics['total_loss'])
+                    if self.use_wandb:
+                        wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
+
+            if (
+                self.config['logging'].get('checkpoint_every') is not None
+                and global_step % self.config['logging']['checkpoint_every'] == 0
+            ):
+                self.save_checkpoint(global_step, stage=stage)
+
+        return train_iter
     
     def train_baseline(self, 
                       train_loader, 
@@ -193,58 +253,18 @@ class HSAETrainer:
         """
         logger.info(f"Training baseline H-SAE for {total_steps} steps")
         
-        history = {
-            'train_loss': [],
-            'val_loss': [],
-            'step': []
-        }
-        
-        # Training loop
+        history = {'train_loss': [], 'val_loss': [], 'step': []}
         train_iter = iter(train_loader)
-        pbar = tqdm(range(total_steps), desc="Baseline Training")
-        
-        for step in pbar:
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
-            
-            if isinstance(batch, (list, tuple)):
-                batch = batch[0]  # Assume first element is the data
-            
-            batch = batch.to(next(self.model.parameters()).device)
-            
-            # Training step
-            metrics = self.train_step(batch, stage="main")
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'Loss': f"{metrics['total_loss']:.4f}",
-                '1-EV': f"{metrics['1-EV']:.4f}",
-                'Temp': f"{metrics['router_temperature']:.3f}"
-            })
-            
-            # Logging
-            if step % self.config['logging']['log_every'] == 0:
-                history['train_loss'].append(metrics['total_loss'])
-                history['step'].append(step)
-                
-                if self.use_wandb:
-                    wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
-                
-                # Validation
-                if val_loader is not None:
-                    val_metrics = self.validate(val_loader)
-                    history['val_loss'].append(val_metrics['total_loss'])
-                    
-                    if self.use_wandb:
-                        wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=step)
-            
-            # Checkpointing
-            if step % self.config['logging']['checkpoint_every'] == 0:
-                self.save_checkpoint(step, stage="baseline")
-        
+        self._run_stage(
+            train_iter,
+            train_loader,
+            val_loader,
+            total_steps,
+            stage='main',
+            history=history,
+            start_step=0,
+            desc='Baseline Training',
+        )
         logger.info("Baseline training completed")
         return history
     
@@ -268,111 +288,39 @@ class HSAETrainer:
         total_steps = stabilize_steps + adapt_steps
         logger.info(f"Training teacher-initialized H-SAE: {stabilize_steps} stabilize + {adapt_steps} adapt = {total_steps} total steps")
         
-        history = {
-            'train_loss': [],
-            'val_loss': [],
-            'step': [],
-            'stage': []
-        }
-        
+        history = {'train_loss': [], 'val_loss': [], 'step': [], 'stage': []}
         train_iter = iter(train_loader)
-        
-        # Stage A: Stabilize (freeze decoder)
+
         logger.info("Stage A: Stabilizing with frozen decoder")
         self._freeze_decoder_weights()
-        
-        pbar = tqdm(range(stabilize_steps), desc="Stage A: Stabilize")
-        for step in pbar:
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
-            
-            if isinstance(batch, (list, tuple)):
-                batch = batch[0]
-            
-            batch = batch.to(next(self.model.parameters()).device)
-            
-            # Training step with causal orthogonality
-            metrics = self.train_step(batch, stage="stabilize")
-            
-            pbar.set_postfix({
-                'Loss': f"{metrics['total_loss']:.4f}",
-                '1-EV': f"{metrics['1-EV']:.4f}",
-                'Causal': f"{metrics['causal_ortho_loss']:.6f}"
-            })
-            
-            # Logging
-            if step % self.config['logging']['log_every'] == 0:
-                history['train_loss'].append(metrics['total_loss'])
-                history['step'].append(step)
-                history['stage'].append('stabilize')
-                
-                if self.use_wandb:
-                    wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
-                    wandb.log({"stage": "stabilize"}, step=step)
-                
-                if val_loader is not None:
-                    val_metrics = self.validate(val_loader)
-                    history['val_loss'].append(val_metrics['total_loss'])
-                    
-                    if self.use_wandb:
-                        wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=step)
-        
-        # Stage B: Adapt (unfreeze decoder)
+        train_iter = self._run_stage(
+            train_iter,
+            train_loader,
+            val_loader,
+            stabilize_steps,
+            stage='stabilize',
+            history=history,
+            start_step=0,
+            desc='Stage A: Stabilize',
+        )
+
         logger.info("Stage B: Adapting with unfrozen decoder")
         self._unfreeze_decoder_weights()
-        
-        # Optionally reduce decoder learning rate
         decoder_lr_mult = self.config['training'].get('teacher_init', {}).get('decoder_lr_mult', 1.0)
         if decoder_lr_mult != 1.0:
             self._set_decoder_lr(self.config['training']['lr'] * decoder_lr_mult)
-        
-        pbar = tqdm(range(adapt_steps), desc="Stage B: Adapt")
-        for step in pbar:
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
-            
-            if isinstance(batch, (list, tuple)):
-                batch = batch[0]
-            
-            batch = batch.to(next(self.model.parameters()).device)
-            
-            # Training step without causal orthogonality
-            metrics = self.train_step(batch, stage="adapt")
-            
-            pbar.set_postfix({
-                'Loss': f"{metrics['total_loss']:.4f}",
-                '1-EV': f"{metrics['1-EV']:.4f}",
-                'Biorth': f"{metrics['biorth_loss']:.6f}"
-            })
-            
-            # Logging
-            global_step = stabilize_steps + step
-            if step % self.config['logging']['log_every'] == 0:
-                history['train_loss'].append(metrics['total_loss'])
-                history['step'].append(global_step)
-                history['stage'].append('adapt')
-                
-                if self.use_wandb:
-                    wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=global_step)
-                    wandb.log({"stage": "adapt"}, step=global_step)
-                
-                if val_loader is not None:
-                    val_metrics = self.validate(val_loader)
-                    history['val_loss'].append(val_metrics['total_loss'])
-                    
-                    if self.use_wandb:
-                        wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
-            
-            # Checkpointing
-            if step % self.config['logging']['checkpoint_every'] == 0:
-                self.save_checkpoint(global_step, stage="teacher_init")
-        
+
+        self._run_stage(
+            train_iter,
+            train_loader,
+            val_loader,
+            adapt_steps,
+            stage='adapt',
+            history=history,
+            start_step=stabilize_steps,
+            desc='Stage B: Adapt',
+        )
+
         logger.info("Teacher-initialized training completed")
         return history
     
@@ -420,21 +368,23 @@ class HSAETrainer:
     
     def _freeze_decoder_weights(self):
         """Freeze decoder weights for stabilization phase."""
-        self.model.parent_decoder.weight.requires_grad = False
-        for i in range(self.model.config.n_parents):
-            self.model.child_decoders[i].weight.requires_grad = False
+        if not self.model.config.use_tied_decoders_parent:
+            self.model.router.decoder.weight.requires_grad = False
+        for sub in self.model.subspaces:
+            if not self.model.config.use_tied_decoders_child:
+                sub.decoder.weight.requires_grad = False
             if not self.model.config.tie_projectors:
-                self.model.up_projectors[i].weight.requires_grad = False
+                sub.up_projector.weight.requires_grad = False
     
     def _unfreeze_decoder_weights(self):
         """Unfreeze decoder weights for adaptation phase."""
         if not self.model.config.use_tied_decoders_parent:
-            self.model.parent_decoder.weight.requires_grad = True
-        for i in range(self.model.config.n_parents):
+            self.model.router.decoder.weight.requires_grad = True
+        for sub in self.model.subspaces:
             if not self.model.config.use_tied_decoders_child:
-                self.model.child_decoders[i].weight.requires_grad = True
+                sub.decoder.weight.requires_grad = True
             if not self.model.config.tie_projectors:
-                self.model.up_projectors[i].weight.requires_grad = True
+                sub.up_projector.weight.requires_grad = True
     
     def _set_decoder_lr(self, lr: float):
         """Set different learning rate for decoder parameters."""
@@ -485,7 +435,7 @@ class HSAETrainer:
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path, map_location=next(self.model.parameters()).device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.step = checkpoint['step']
@@ -503,5 +453,5 @@ def create_data_loader(activations: torch.Tensor,
         batch_size=batch_size, 
         shuffle=shuffle,
         num_workers=0,  # Avoid multiprocessing issues
-        pin_memory=True if torch.cuda.is_available() else False
+        pin_memory=True if torch.cuda.is_available() else False,
     )

@@ -9,50 +9,78 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional, Dict, Any
-from scipy.linalg import sqrtm
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
 
 class CausalGeometry:
     """Handles causal inner product computations and geometric operations."""
-    
-    def __init__(self, unembedding_matrix: torch.Tensor, shrinkage: float = 0.05):
+
+    def __init__(
+        self,
+        unembedding_matrix: torch.Tensor,
+        shrinkage: float = 0.05,
+        cov_device: str = "cpu",
+        cache_dir: Optional[str] = None,
+    ):
         """
         Initialize causal geometry with unembedding matrix.
-        
+
         Args:
             unembedding_matrix: U ∈ R^{V×d} unembedding matrix
             shrinkage: Shrinkage parameter for covariance regularization
+            cov_device: Device used for covariance computation
+            cache_dir: Optional directory to cache Σ and W for reuse
         """
-        # Always compute Σ & W in float32 on CPU for stability
-        self.U = unembedding_matrix.detach().to('cpu', dtype=torch.float32)
         self.shrinkage = shrinkage
         self.device = unembedding_matrix.device
         self.dtype = torch.float32
-        
+        self.cov_device = cov_device
+        self.cache_dir = cache_dir
+        self.U = unembedding_matrix.detach()
+
         # Compute whitening matrix
-        self.Sigma, self.W = self._compute_whitening_matrix()
-        
-    def _compute_whitening_matrix(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.Sigma, self.W = self._compute_whitening_matrix(self.U)
+
+    def _compute_whitening_matrix(
+        self, unembedding_matrix: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute covariance matrix Σ and whitening matrix W = Σ^{-1/2}.
-        
+
+        Args:
+            unembedding_matrix: Unembedding matrix
+
         Returns:
             Tuple of (Sigma, W) tensors
         """
+        sigma_file = w_file = None
+        if self.cache_dir is not None:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            sigma_file = os.path.join(self.cache_dir, "sigma.pt")
+            w_file = os.path.join(self.cache_dir, "whitening.pt")
+            if os.path.exists(sigma_file) and os.path.exists(w_file):
+                logger.info("Loading cached whitening matrices from disk")
+                Sigma = torch.load(sigma_file, map_location=self.cov_device)
+                W = torch.load(w_file, map_location=self.cov_device)
+                return Sigma, W
+
         logger.info("Computing whitening matrix from unembedding rows")
-        
-        # Compute covariance of unembedding rows (float32, CPU)
-        U_centered = self.U - self.U.mean(dim=0, keepdim=True)
-        Sigma = torch.cov(U_centered.T) + self.shrinkage * torch.eye(self.U.shape[1])
-        
-        # Eigen-decomposition for W = Σ^{-1/2}
+
+        U = unembedding_matrix.detach().to(self.cov_device, dtype=torch.float32)
+        U_centered = U - U.mean(dim=0, keepdim=True)
+        Sigma = torch.cov(U_centered.T) + self.shrinkage * torch.eye(U.shape[1], device=self.cov_device)
+
         eigenvals, eigenvecs = torch.linalg.eigh(Sigma)
         eigenvals = torch.clamp(eigenvals, min=1e-8)
         W = eigenvecs @ torch.diag(1.0 / torch.sqrt(eigenvals)) @ eigenvecs.T
-        
+
+        if sigma_file is not None and w_file is not None:
+            torch.save(Sigma.cpu(), sigma_file)
+            torch.save(W.cpu(), w_file)
+
         return Sigma, W
     
     def whiten(self, x: torch.Tensor) -> torch.Tensor:

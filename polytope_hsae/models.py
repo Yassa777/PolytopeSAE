@@ -12,6 +12,7 @@ from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
 import logging
 from dataclasses import dataclass
+from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class HSAEConfig:
     tie_projectors: bool = False
     use_decoder_bias: bool = True
     use_offdiag_biorth: bool = False  # Use off-diagonal-only cross-orthogonality
+    use_gradient_checkpointing: bool = False
 
 
 class StandardSAE(nn.Module):
@@ -131,69 +133,121 @@ class StandardSAE(nn.Module):
                 self.decoder.weight.div_(decoder_norms + 1e-8)
 
 
+class Router(nn.Module):
+    """Top-level router projecting inputs to parent codes."""
+
+    def __init__(self, input_dim: int, n_parents: int):
+        super().__init__()
+        self.encoder = nn.Linear(input_dim, n_parents, bias=True)
+        self.decoder = nn.Linear(n_parents, input_dim, bias=False)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+    def decode(self, codes: torch.Tensor, tied: bool) -> torch.Tensor:
+        if tied:
+            return F.linear(codes, self.encoder.weight)
+        return F.linear(codes, self.decoder.weight)
+
+
+class SubspaceModule(nn.Module):
+    """Handles per-parent subspace projections and child SAE."""
+
+    def __init__(self, input_dim: int, subspace_dim: int, n_children: int):
+        super().__init__()
+        self.down_projector = nn.Linear(input_dim, subspace_dim, bias=False)
+        self.up_projector = nn.Linear(subspace_dim, input_dim, bias=False)
+        self.encoder = nn.Linear(subspace_dim, n_children, bias=True)
+        self.decoder = nn.Linear(n_children, subspace_dim, bias=False)
+
+    def project_down(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_projector(x)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+    def decode(self, z: torch.Tensor, tied: bool) -> torch.Tensor:
+        if tied:
+            return F.linear(z, self.encoder.weight)
+        return F.linear(z, self.decoder.weight)
+
+    def project_up(self, x: torch.Tensor, tied: bool) -> torch.Tensor:
+        if tied:
+            return F.linear(x, self.down_projector.weight)
+        return self.up_projector(x)
+
+
 class HierarchicalSAE(nn.Module):
     """Hierarchical Sparse Autoencoder with Top-K routing."""
-    
+
     def __init__(self, config: HSAEConfig):
         super().__init__()
         self.config = config
-        
-        # Parent (router) SAE
-        self.parent_encoder = nn.Linear(config.input_dim, config.n_parents, bias=True)
-        self.parent_decoder = nn.Linear(config.n_parents, config.input_dim, bias=False)
-        
-        # Child SAEs (one per parent)
-        self.child_encoders = nn.ModuleList()
-        self.child_decoders = nn.ModuleList()
-        self.down_projectors = nn.ModuleList()  # input_dim -> subspace_dim
-        self.up_projectors = nn.ModuleList()   # subspace_dim -> input_dim
-        
-        for _ in range(config.n_parents):
-            # Down/up projectors for this parent's subspace
-            down_proj = nn.Linear(config.input_dim, config.subspace_dim, bias=False)
-            up_proj = nn.Linear(config.subspace_dim, config.input_dim, bias=False)
-            
-            # Child encoder/decoder in subspace
-            child_enc = nn.Linear(config.subspace_dim, config.n_children_per_parent, bias=True)
-            child_dec = nn.Linear(config.n_children_per_parent, config.subspace_dim, bias=False)
-            
-            self.down_projectors.append(down_proj)
-            self.up_projectors.append(up_proj)
-            self.child_encoders.append(child_enc)
-            self.child_decoders.append(child_dec)
-        
+
+        # Router module
+        self.router = Router(config.input_dim, config.n_parents)
+
+        # Subspace modules, one per parent
+        self.subspaces = nn.ModuleList(
+            [
+                SubspaceModule(
+                    config.input_dim, config.subspace_dim, config.n_children_per_parent
+                )
+                for _ in range(config.n_parents)
+            ]
+        )
+
         # Decoder bias
         self.decoder_bias = nn.Parameter(torch.zeros(config.input_dim))
-        
+
         # Temperature for gumbel softmax (annealed during training)
-        self.register_buffer('router_temperature', torch.tensor(config.router_temp_start))
-        
+        self.register_buffer("router_temperature", torch.tensor(config.router_temp_start))
+
         self._initialize_weights()
+
+    def _sample_codes(self, logits: torch.Tensor, k: int) -> torch.Tensor:
+        """Sample Top-K codes with optional Gumbel noise."""
+        if k == 1:
+            if self.training:
+                return F.gumbel_softmax(logits, tau=self.router_temperature, hard=True)
+            codes = torch.zeros_like(logits)
+            idx = logits.argmax(dim=-1, keepdim=True)
+            codes.scatter_(-1, idx, 1.0)
+            return codes
+        if self.training:
+            noise = torch.rand_like(logits)
+            gumbel = -torch.log(-torch.log(noise.clamp_min(1e-8)).clamp_min(1e-8))
+            logits_noisy = logits + gumbel * self.router_temperature
+            topk_vals, topk_idx = torch.topk(logits_noisy, k, dim=-1)
+            hard_mask = torch.zeros_like(logits)
+            hard_mask.scatter_(-1, topk_idx, 1.0)
+            soft = F.softmax(logits / (self.router_temperature + 1e-8), dim=-1)
+            soft_masked = soft * hard_mask
+            soft_masked = soft_masked / (soft_masked.sum(dim=-1, keepdim=True) + 1e-8)
+            return (hard_mask - soft_masked).detach() + soft_masked
+        topk_vals, topk_idx = torch.topk(logits, k, dim=-1)
+        codes = torch.zeros_like(logits)
+        codes.scatter_(-1, topk_idx, 1.0)
+        return codes
     
     def _initialize_weights(self):
         """Initialize weights."""
-        # Parent encoder/decoder
-        nn.init.xavier_uniform_(self.parent_encoder.weight)
-        nn.init.zeros_(self.parent_encoder.bias)
-        
-        # Initialize parent decoder columns to unit norm
+        # Router weights
+        nn.init.xavier_uniform_(self.router.encoder.weight)
+        nn.init.zeros_(self.router.encoder.bias)
         with torch.no_grad():
-            parent_norms = torch.norm(self.parent_decoder.weight, dim=0, keepdim=True)
-            self.parent_decoder.weight.div_(parent_norms + 1e-8)
-        
-        # Child components
-        for i in range(self.config.n_parents):
-            # Projectors: orthogonal initialization
-            nn.init.orthogonal_(self.down_projectors[i].weight)
-            nn.init.orthogonal_(self.up_projectors[i].weight)
-            
-            # Child encoder/decoder
-            nn.init.xavier_uniform_(self.child_encoders[i].weight)
-            nn.init.zeros_(self.child_encoders[i].bias)
-            
+            parent_norms = torch.norm(self.router.decoder.weight, dim=0, keepdim=True)
+            self.router.decoder.weight.div_(parent_norms + 1e-8)
+
+        # Subspace modules
+        for sub in self.subspaces:
+            nn.init.orthogonal_(sub.down_projector.weight)
+            nn.init.orthogonal_(sub.up_projector.weight)
+            nn.init.xavier_uniform_(sub.encoder.weight)
+            nn.init.zeros_(sub.encoder.bias)
             with torch.no_grad():
-                child_norms = torch.norm(self.child_decoders[i].weight, dim=0, keepdim=True)
-                self.child_decoders[i].weight.div_(child_norms + 1e-8)
+                child_norms = torch.norm(sub.decoder.weight, dim=0, keepdim=True)
+                sub.decoder.weight.div_(child_norms + 1e-8)
     
     def initialize_from_teacher(self, 
                               parent_vectors: torch.Tensor,
@@ -210,31 +264,24 @@ class HierarchicalSAE(nn.Module):
         logger.info("Initializing H-SAE from teacher vectors")
         
         with torch.no_grad():
-            # Initialize parent decoder rows
-            self.parent_decoder.weight.copy_(parent_vectors.T)  # Transpose for Linear layer
-            
+            self.router.decoder.weight.copy_(parent_vectors.T)
+
             if geometry is not None:
-                # Normalize under causal norm
                 for i in range(self.config.n_parents):
-                    parent_vec = self.parent_decoder.weight[:, i]
+                    parent_vec = self.router.decoder.weight[:, i]
                     normalized_vec = geometry.normalize_causal(parent_vec)
-                    self.parent_decoder.weight[:, i] = normalized_vec
-            
-            # Initialize projectors and child decoders
+                    self.router.decoder.weight[:, i] = normalized_vec
+
             for i, (down_proj, up_proj) in enumerate(child_projectors):
                 if i >= self.config.n_parents:
                     break
-                    
-                self.down_projectors[i].weight.copy_(down_proj)
-                self.up_projectors[i].weight.copy_(up_proj)
-                
-                # Initialize child decoder with orthogonal basis in subspace
-                # This will be learned during training
-                nn.init.orthogonal_(self.child_decoders[i].weight)
-                
-                with torch.no_grad():
-                    child_norms = torch.norm(self.child_decoders[i].weight, dim=0, keepdim=True)
-                    self.child_decoders[i].weight.div_(child_norms + 1e-8)
+                sub = self.subspaces[i]
+                sub.down_projector.weight.copy_(down_proj)
+                sub.up_projector.weight.copy_(up_proj)
+
+                nn.init.orthogonal_(sub.decoder.weight)
+                child_norms = torch.norm(sub.decoder.weight, dim=0, keepdim=True)
+                sub.decoder.weight.div_(child_norms + 1e-8)
     
     def encode_parent(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -246,32 +293,8 @@ class HierarchicalSAE(nn.Module):
         Returns:
             Tuple of (parent_logits, parent_codes)
         """
-        parent_logits = self.parent_encoder(x)
-        
-        if self.training:
-            # Add Gumbel noise for exploration
-            noise = torch.rand_like(parent_logits)
-            gumbel = -torch.log(-torch.log(noise.clamp_min(1e-8)).clamp_min(1e-8))
-            logits = parent_logits + gumbel * self.router_temperature
-
-            # Top-K mask (hard)
-            topk_vals, topk_idx = torch.topk(logits, self.config.topk_parent, dim=-1)
-            hard_mask = torch.zeros_like(parent_logits)
-            hard_mask.scatter_(-1, topk_idx, 1.0)
-
-            # Soft probs for gradient; restrict mass to Top-K
-            soft = F.softmax(parent_logits / (self.router_temperature + 1e-8), dim=-1)
-            soft_masked = soft * hard_mask
-            soft_masked = soft_masked / (soft_masked.sum(dim=-1, keepdim=True) + 1e-8)
-
-            # Straight-through estimator
-            parent_codes = (hard_mask - soft_masked).detach() + soft_masked
-        else:
-            # Hard top-k for inference
-            topk_vals, topk_indices = torch.topk(parent_logits, self.config.topk_parent, dim=-1)
-            parent_codes = torch.zeros_like(parent_logits)
-            parent_codes.scatter_(-1, topk_indices, 1.0)
-        
+        parent_logits = self.router.encode(x)
+        parent_codes = self._sample_codes(parent_logits, self.config.topk_parent)
         return parent_logits, parent_codes
     
     def encode_children(self, x: torch.Tensor, parent_codes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -286,53 +309,29 @@ class HierarchicalSAE(nn.Module):
             Tuple of (child_logits, child_codes) [batch_size, n_parents, n_children_per_parent]
         """
         batch_size = x.shape[0]
-        child_logits = torch.zeros(batch_size, self.config.n_parents, self.config.n_children_per_parent, device=x.device)
+        child_logits = torch.zeros(
+            batch_size,
+            self.config.n_parents,
+            self.config.n_children_per_parent,
+            device=x.device,
+        )
         child_codes = torch.zeros_like(child_logits)
-        
-        for parent_idx in range(self.config.n_parents):
-            # Check which samples have this parent active
+
+        for parent_idx, sub in enumerate(self.subspaces):
             active_mask = parent_codes[:, parent_idx] > 0
             if not active_mask.any():
                 continue
-                
-            # Project to parent's subspace
-            x_subspace = self.down_projectors[parent_idx](x[active_mask])
-            
-            # Encode in subspace
-            child_logits_p = self.child_encoders[parent_idx](x_subspace)
-            child_logits[active_mask, parent_idx] = child_logits_p
-            
-            # Top-K child selection
-            if self.config.topk_child == 1:
-                # Use Gumbel softmax for K=1 (differentiable)
-                child_codes_p = F.gumbel_softmax(child_logits_p, tau=self.router_temperature, hard=True)
+
+            x_subspace = sub.project_down(x[active_mask])
+            if self.config.use_gradient_checkpointing and x_subspace.requires_grad:
+                logits_p = checkpoint(sub.encode, x_subspace)
             else:
-                # Use straight-through estimator for K>1
-                if self.training:
-                    # Add Gumbel noise
-                    noise = torch.rand_like(child_logits_p)
-                    gumbel = -torch.log(-torch.log(noise.clamp_min(1e-8)).clamp_min(1e-8))
-                    logits_child = child_logits_p + gumbel * self.router_temperature
+                logits_p = sub.encode(x_subspace)
+            child_logits[active_mask, parent_idx] = logits_p
 
-                    # Top-K mask (hard)
-                    topk_vals, topk_indices = torch.topk(logits_child, self.config.topk_child, dim=-1)
-                    hard_mask = torch.zeros_like(child_logits_p)
-                    hard_mask.scatter_(-1, topk_indices, 1.0)
-
-                    # Soft probs for gradient
-                    soft = F.softmax(child_logits_p / (self.router_temperature + 1e-8), dim=-1)
-                    soft_masked = soft * hard_mask
-                    soft_masked = soft_masked / (soft_masked.sum(dim=-1, keepdim=True) + 1e-8)
-
-                    # Straight-through estimator
-                    child_codes_p = (hard_mask - soft_masked).detach() + soft_masked
-                else:
-                    topk_vals, topk_indices = torch.topk(child_logits_p, self.config.topk_child, dim=-1)
-                    child_codes_p = torch.zeros_like(child_logits_p)
-                    child_codes_p.scatter_(-1, topk_indices, 1.0)
-            
+            child_codes_p = self._sample_codes(logits_p, self.config.topk_child)
             child_codes[active_mask, parent_idx] = child_codes_p
-        
+
         return child_logits, child_codes
     
     def decode(self, parent_codes: torch.Tensor, child_codes: torch.Tensor) -> torch.Tensor:
@@ -347,41 +346,46 @@ class HierarchicalSAE(nn.Module):
             Reconstructed input [batch_size, input_dim]
         """
         batch_size = parent_codes.shape[0]
-        reconstruction = torch.zeros(batch_size, self.config.input_dim, device=parent_codes.device)
-        
-        # Parent reconstruction (tied or untied)
-        if self.config.use_tied_decoders_parent:
-            parent_recon = F.linear(parent_codes, self.parent_encoder.weight)
-        else:
-            parent_recon = F.linear(parent_codes, self.parent_decoder.weight.t())
+        reconstruction = torch.zeros(
+            batch_size, self.config.input_dim, device=parent_codes.device
+        )
+
+        parent_recon = self.router.decode(
+            parent_codes, self.config.use_tied_decoders_parent
+        )
         reconstruction += parent_recon
-        
-        # Child reconstruction
-        for parent_idx in range(self.config.n_parents):
-            # Check which samples have this parent active
+
+        for parent_idx, sub in enumerate(self.subspaces):
             active_mask = parent_codes[:, parent_idx] > 0
             if not active_mask.any():
                 continue
-            
-            # Decode child codes in subspace (tied or untied)
+
             child_codes_p = child_codes[active_mask, parent_idx]
-            if self.config.use_tied_decoders_child:
-                child_recon_subspace = F.linear(child_codes_p, self.child_encoders[parent_idx].weight)
+            if self.config.use_gradient_checkpointing and child_codes_p.requires_grad:
+                def _decode(cc):
+                    return sub.decode(cc, self.config.use_tied_decoders_child)
+
+                child_recon_subspace = checkpoint(_decode, child_codes_p)
             else:
-                child_recon_subspace = F.linear(child_codes_p, self.child_decoders[parent_idx].weight.t())
-            
-            # Project back to full space (tied or untied projectors)
-            if self.config.tie_projectors:
-                child_recon_full = F.linear(child_recon_subspace, self.down_projectors[parent_idx].weight)
+                child_recon_subspace = sub.decode(
+                    child_codes_p, self.config.use_tied_decoders_child
+                )
+
+            if self.config.use_gradient_checkpointing and child_recon_subspace.requires_grad:
+                def _project(u):
+                    return sub.project_up(u, self.config.tie_projectors)
+
+                child_recon_full = checkpoint(_project, child_recon_subspace)
             else:
-                child_recon_full = self.up_projectors[parent_idx](child_recon_subspace)
-                
+                child_recon_full = sub.project_up(
+                    child_recon_subspace, self.config.tie_projectors
+                )
+
             reconstruction[active_mask] += child_recon_full
-        
-        # Add bias (optional)
+
         if self.config.use_decoder_bias:
             reconstruction += self.decoder_bias
-        
+
         return reconstruction
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
@@ -402,10 +406,9 @@ class HierarchicalSAE(nn.Module):
         x_hat = self.decode(parent_codes, child_codes)
         
         # Compute top-level reconstruction for baseline parity
-        if self.config.use_tied_decoders_parent:
-            parent_recon = F.linear(parent_codes, self.parent_encoder.weight)
-        else:
-            parent_recon = F.linear(parent_codes, self.parent_decoder.weight.t())
+        parent_recon = self.router.decode(
+            parent_codes, self.config.use_tied_decoders_parent
+        )
         if self.config.use_decoder_bias:
             parent_recon += self.decoder_bias
             
@@ -435,18 +438,22 @@ class HierarchicalSAE(nn.Module):
                 # Our style: E^T D ≈ I penalty
                 biorth_penalty = 0
                 
-                # Parent bi-orthogonality: E^T D ≈ I
                 if not self.config.use_tied_decoders_parent:
-                    parent_enc_dec = self.parent_encoder.weight @ self.parent_decoder.weight
+                    parent_enc_dec = self.router.encoder.weight @ self.router.decoder.weight
                     parent_identity = torch.eye(self.config.n_parents, device=x.device)
-                    biorth_penalty += torch.norm(parent_enc_dec - parent_identity, 'fro') ** 2
-                
-                # Child bi-orthogonality
+                    biorth_penalty += torch.norm(
+                        parent_enc_dec - parent_identity, "fro"
+                    ) ** 2
+
                 if not self.config.use_tied_decoders_child:
-                    for i in range(self.config.n_parents):
-                        child_enc_dec = self.child_encoders[i].weight @ self.child_decoders[i].weight
-                        child_identity = torch.eye(self.config.n_children_per_parent, device=x.device)
-                        biorth_penalty += torch.norm(child_enc_dec - child_identity, 'fro') ** 2
+                    for sub in self.subspaces:
+                        child_enc_dec = sub.encoder.weight @ sub.decoder.weight
+                        child_identity = torch.eye(
+                            self.config.n_children_per_parent, device=x.device
+                        )
+                        biorth_penalty += torch.norm(
+                            child_enc_dec - child_identity, "fro"
+                        ) ** 2
             
             metrics['biorth_penalty'] = self.config.biorth_lambda * biorth_penalty
         
@@ -464,19 +471,19 @@ class HierarchicalSAE(nn.Module):
         """
         penalty = 0
         
-        for parent_idx in range(self.config.n_parents):
-            parent_vector = self.parent_decoder.weight[:, parent_idx]
-            
-            # For each child of this parent
+        for parent_idx, sub in enumerate(self.subspaces):
+            parent_vector = self.router.decoder.weight[:, parent_idx]
+
             for child_idx in range(self.config.n_children_per_parent):
-                # Get child vector in full space
-                child_subspace = self.child_decoders[parent_idx].weight[:, child_idx]
-                child_full = self.up_projectors[parent_idx](child_subspace)
-                
-                # Compute delta: δ_{c|p} = ℓ_c - ℓ_p
+                child_subspace = sub.decoder.weight[:, child_idx]
+                if self.config.tie_projectors:
+                    child_full = F.linear(
+                        child_subspace.unsqueeze(0), sub.down_projector.weight
+                    ).squeeze(0)
+                else:
+                    child_full = sub.up_projector(child_subspace.unsqueeze(0)).squeeze(0)
+
                 delta = child_full - parent_vector
-                
-                # Causal inner product penalty
                 inner_prod = geometry.causal_inner_product(parent_vector, delta)
                 penalty += inner_prod ** 2
         
@@ -486,14 +493,12 @@ class HierarchicalSAE(nn.Module):
         """Normalize decoder columns to unit norm."""
         if self.config.normalize_decoder:
             with torch.no_grad():
-                # Parent decoder
-                parent_norms = torch.norm(self.parent_decoder.weight, dim=0, keepdim=True)
-                self.parent_decoder.weight.div_(parent_norms + 1e-8)
-                
-                # Child decoders
-                for i in range(self.config.n_parents):
-                    child_norms = torch.norm(self.child_decoders[i].weight, dim=0, keepdim=True)
-                    self.child_decoders[i].weight.div_(child_norms + 1e-8)
+                parent_norms = torch.norm(self.router.decoder.weight, dim=0, keepdim=True)
+                self.router.decoder.weight.div_(parent_norms + 1e-8)
+
+                for sub in self.subspaces:
+                    child_norms = torch.norm(sub.decoder.weight, dim=0, keepdim=True)
+                    sub.decoder.weight.div_(child_norms + 1e-8)
     
     def update_router_temperature(self, step: int, total_steps: int):
         """Update router temperature according to schedule."""
@@ -503,22 +508,23 @@ class HierarchicalSAE(nn.Module):
     
     def _biorth_penalty_parent_offdiag(self) -> torch.Tensor:
         """JAX-style off-diagonal cross-orthogonality penalty for parent."""
-        E = F.normalize(self.parent_encoder.weight, dim=1)  # [P, d]
+        E = F.normalize(self.router.encoder.weight, dim=1)  # [P, d]
         if self.config.use_tied_decoders_parent:
-            D = F.normalize(self.parent_encoder.weight, dim=1)  # [P, d] 
+            D = F.normalize(self.router.encoder.weight, dim=1)  # [P, d]
         else:
-            D = F.normalize(self.parent_decoder.weight.t(), dim=0)  # [P, d]
+            D = F.normalize(self.router.decoder.weight.t(), dim=0)  # [P, d]
         M = E @ D.t()  # [P, P]
         off = M - torch.diag(torch.diag(M))
         return off.pow(2).sum() / (M.numel() - M.shape[0])
     
     def _biorth_penalty_child_offdiag(self, parent_idx: int) -> torch.Tensor:
         """JAX-style off-diagonal cross-orthogonality penalty for child."""
-        E = F.normalize(self.child_encoders[parent_idx].weight, dim=1)  # [C, s]
+        sub = self.subspaces[parent_idx]
+        E = F.normalize(sub.encoder.weight, dim=1)  # [C, s]
         if self.config.use_tied_decoders_child:
-            D = F.normalize(self.child_encoders[parent_idx].weight, dim=1)  # [C, s]
+            D = F.normalize(sub.encoder.weight, dim=1)  # [C, s]
         else:
-            D = F.normalize(self.child_decoders[parent_idx].weight.t(), dim=0)  # [C, s]
+            D = F.normalize(sub.decoder.weight.t(), dim=0)  # [C, s]
         M = E @ D.t()  # [C, C]
         off = M - torch.diag(torch.diag(M))
         return off.pow(2).sum() / (M.numel() - M.shape[0])
@@ -546,15 +552,21 @@ def count_parameters(model: nn.Module) -> int:
 
 def freeze_decoder_weights(model: HierarchicalSAE):
     """Freeze decoder weights for stabilization phase."""
-    model.parent_decoder.weight.requires_grad = False
-    for i in range(model.config.n_parents):
-        model.child_decoders[i].weight.requires_grad = False
-        model.up_projectors[i].weight.requires_grad = False
+    if not model.config.use_tied_decoders_parent:
+        model.router.decoder.weight.requires_grad = False
+    for sub in model.subspaces:
+        if not model.config.use_tied_decoders_child:
+            sub.decoder.weight.requires_grad = False
+        if not model.config.tie_projectors:
+            sub.up_projector.weight.requires_grad = False
 
 
 def unfreeze_decoder_weights(model: HierarchicalSAE):
     """Unfreeze decoder weights for adaptation phase."""
-    model.parent_decoder.weight.requires_grad = True
-    for i in range(model.config.n_parents):
-        model.child_decoders[i].weight.requires_grad = True
-        model.up_projectors[i].weight.requires_grad = True
+    if not model.config.use_tied_decoders_parent:
+        model.router.decoder.weight.requires_grad = True
+    for sub in model.subspaces:
+        if not model.config.use_tied_decoders_child:
+            sub.decoder.weight.requires_grad = True
+        if not model.config.tie_projectors:
+            sub.up_projector.weight.requires_grad = True
