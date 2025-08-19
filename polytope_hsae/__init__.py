@@ -1,7 +1,7 @@
 """
 Polytope Discovery & Hierarchical SAE Integration
 
-A research framework for validating geometric structure of categorical and hierarchical 
+A research framework for validating geometric structure of categorical and hierarchical
 concepts in LLMs and incorporating that structure into Hierarchical Sparse Autoencoders.
 """
 
@@ -21,7 +21,7 @@ from . import metrics
 
 __all__ = [
     "geometry",
-    "estimators", 
+    "estimators",
     "validation",
     "concepts",
     "activations",
