@@ -123,9 +123,10 @@ class LDAEstimator:
             # Whiten data
             X_whitened = geometry.whiten(X_all)
             
-            # Fit LDA
-            lda = LinearDiscriminantAnalysis(shrinkage=self.shrinkage)
-            lda.fit(X_whitened.numpy(), y_all.numpy())
+            # Fit LDA with proper solver for shrinkage
+            lda = LinearDiscriminantAnalysis(solver='eigen', shrinkage=self.shrinkage)
+            lda.fit(X_whitened.to(dtype=torch.float32).cpu().numpy(),
+                    y_all.cpu().numpy())
             
             # Extract directions and transform back
             for i in range(n_classes):
@@ -245,7 +246,8 @@ class ConceptVectorEstimator:
             delta_matrix = torch.stack(list(deltas.values()))  # [n_children, d]
             
             # SVD to find subspace
-            U, S, V = torch.svd(delta_matrix)
+            U, S, Vh = torch.linalg.svd(delta_matrix, full_matrices=False)
+            V = Vh.t()
             
             # Take top subspace_dim components
             k = min(subspace_dim, delta_matrix.shape[0], delta_matrix.shape[1])

@@ -50,13 +50,10 @@ setup(
             "bokeh>=3.2.0",
         ],
     },
-    entry_points={
-        "console_scripts": [
-            "polytope-experiment=polytope_hsae.cli:main",
-        ],
-    },
+    # entry_points left empty until CLI is added
+    entry_points={},
     include_package_data=True,
     package_data={
-        "polytope_hsae": ["configs/*.yaml"],
+        "": ["configs/*.yaml"],
     },
 )

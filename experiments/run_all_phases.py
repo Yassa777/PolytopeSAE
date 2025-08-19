@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 from datetime import datetime
 import json
+import os
+import wandb
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -84,11 +86,25 @@ def main():
     exp_base_dir = Path(config['logging']['save_dir'])
     exp_base_dir.mkdir(parents=True, exist_ok=True)
     
+    # Initialize W&B experiment tracking
+    wandb_project = config.get('wandb_project', 'polytope-hsae')
+    experiment_name = f"full_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    wandb.init(
+        project=wandb_project,
+        name=experiment_name,
+        config=config,
+        tags=['full-experiment', 'all-phases'],
+        notes=f"Complete 4-phase experiment: {config.get('run', {}).get('notes', 'V2 focused experiment')}"
+    )
+    
     # Track experiment progress
     experiment_log = {
         'start_time': datetime.now().isoformat(),
         'config_path': args.config,
         'device': args.device,
+        'wandb_run_id': wandb.run.id,
+        'wandb_run_url': wandb.run.get_url(),
         'phases': {}
     }
     
@@ -155,10 +171,24 @@ def main():
     experiment_log['successful_phases'] = successful_phases
     experiment_log['failed_phases'] = failed_phases
     
+    # Log final results to W&B
+    total_phases = len([p for p in phases if not p[2]])
+    success_rate = successful_phases / total_phases if total_phases > 0 else 0
+    
+    wandb.log({
+        "experiment/total_duration_hours": total_duration.total_seconds() / 3600,
+        "experiment/successful_phases": successful_phases,
+        "experiment/failed_phases": failed_phases,
+        "experiment/total_phases": total_phases,
+        "experiment/success_rate": success_rate,
+    })
+    
     # Save experiment log
     log_file = exp_base_dir / f"experiment_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(log_file, 'w') as f:
         json.dump(experiment_log, f, indent=2)
+    
+    logger.info(f"🔗 W&B experiment: {wandb.run.get_url()}")
     
     # Print summary
     logger.info("=" * 60)
@@ -196,6 +226,9 @@ def main():
         logger.error(f"❌ Experiment incomplete - {failed_phases} phases failed")
     
     logger.info("=" * 60)
+    
+    # Finish W&B run
+    wandb.finish()
     
     # Exit with appropriate code
     sys.exit(0 if failed_phases == 0 else 1)

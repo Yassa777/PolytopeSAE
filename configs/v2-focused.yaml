@@ -8,7 +8,7 @@ run:
   notes: "V2 focused experiment: teacher extraction + baseline vs teacher-init H-SAE comparison"
 
 model:
-  name: gemma-2b-it  # or gemma-2b
+  name: google/gemma-2b  # or gemma-2b
   dtype: bf16
   activation_hook: final_residual_pre_unembed
   layers_probe: ["last"]  # Single late layer only
@@ -53,6 +53,14 @@ hsae:
   biorth_lambda: 5.0e-4      # Down-weighted
   causal_ortho_lambda: 2.0e-4  # Applied only during freeze stage
   router_temp: {start: 1.5, end: 0.7}
+  top_level_beta: 0.1        # Top-level reconstruction weight
+  
+  # Our default settings (teacher-init friendly)
+  use_tied_decoders_parent: false
+  use_tied_decoders_child: false
+  tie_projectors: false
+  use_decoder_bias: true
+  use_offdiag_biorth: false
 
 training:
   optimizer: adamw
@@ -115,3 +123,6 @@ logging:
   phase_2_log: "baseline_hsae" 
   phase_3_log: "teacher_init_hsae"
   phase_4_log: "evaluation_steering"
+
+# W&B configuration
+wandb_project: "polytope-hsae"

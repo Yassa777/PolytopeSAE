@@ -26,10 +26,11 @@ class CausalGeometry:
             unembedding_matrix: U ∈ R^{V×d} unembedding matrix
             shrinkage: Shrinkage parameter for covariance regularization
         """
-        self.U = unembedding_matrix.detach().cpu()
+        # Always compute Σ & W in float32 on CPU for stability
+        self.U = unembedding_matrix.detach().to('cpu', dtype=torch.float32)
         self.shrinkage = shrinkage
         self.device = unembedding_matrix.device
-        self.dtype = unembedding_matrix.dtype
+        self.dtype = torch.float32
         
         # Compute whitening matrix
         self.Sigma, self.W = self._compute_whitening_matrix()
@@ -43,28 +44,21 @@ class CausalGeometry:
         """
         logger.info("Computing whitening matrix from unembedding rows")
         
-        # Compute covariance of unembedding rows
+        # Compute covariance of unembedding rows (float32, CPU)
         U_centered = self.U - self.U.mean(dim=0, keepdim=True)
         Sigma = torch.cov(U_centered.T) + self.shrinkage * torch.eye(self.U.shape[1])
         
-        # Compute matrix square root inverse
-        try:
-            # Use scipy for numerical stability
-            Sigma_np = Sigma.numpy()
-            W_np = sqrtm(np.linalg.inv(Sigma_np)).real
-            W = torch.from_numpy(W_np).float()
-        except Exception as e:
-            logger.warning(f"Failed to compute matrix square root with scipy: {e}")
-            # Fallback to eigendecomposition
-            eigenvals, eigenvecs = torch.linalg.eigh(Sigma)
-            eigenvals = torch.clamp(eigenvals, min=1e-8)  # Numerical stability
-            W = eigenvecs @ torch.diag(1.0 / torch.sqrt(eigenvals)) @ eigenvecs.T
-            
+        # Eigen-decomposition for W = Σ^{-1/2}
+        eigenvals, eigenvecs = torch.linalg.eigh(Sigma)
+        eigenvals = torch.clamp(eigenvals, min=1e-8)
+        W = eigenvecs @ torch.diag(1.0 / torch.sqrt(eigenvals)) @ eigenvecs.T
+        
         return Sigma, W
     
     def whiten(self, x: torch.Tensor) -> torch.Tensor:
         """Apply whitening transformation: x̃ = Wx."""
-        return x @ self.W.T
+        W = self.W.to(x.device, dtype=x.dtype if x.dtype.is_floating_point else torch.float32)
+        return x @ W.T
     
     def causal_inner_product(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
@@ -105,7 +99,13 @@ class CausalGeometry:
     def normalize_causal(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize vector under causal norm."""
         norm = self.causal_norm(x)
-        return x / (norm + 1e-8)  # Add epsilon for numerical stability
+        return x / (norm + 1e-8)
+    
+    def to(self, device: str):
+        """Move geometry matrices to specified device for training."""
+        self.W = self.W.to(device)
+        self.Sigma = self.Sigma.to(device)
+        return self
     
     def project_causal(self, x: torch.Tensor, onto: torch.Tensor) -> torch.Tensor:
         """
@@ -236,9 +236,16 @@ def intervention_test(model, tokenizer, geometry: CausalGeometry,
         intervention_logits = []
         
         def intervention_hook(module, input, output):
-            # Add α * parent_vector to residual stream
-            output[0][:, -1] += alpha * parent_vector
-            return output
+            # Add α * parent_vector to the last token's residual
+            if isinstance(output, tuple):
+                h = output[0]
+                h = h.clone()
+                h[:, -1, :] = h[:, -1, :] + alpha * parent_vector
+                return (h,) + output[1:]
+            else:
+                h = output.clone()
+                h[:, -1, :] = h[:, -1, :] + alpha * parent_vector
+                return h
         
         # Register hook (assuming final residual layer)
         hook_handle = None

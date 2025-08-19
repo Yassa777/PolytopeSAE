@@ -43,13 +43,22 @@ class ActivationCapture:
         self.config = config
         self.device = torch.device(config.device)
         
-        # Load model and tokenizer
+        # Use AutoModelForCausalLM when available to ensure consistent heads;
+        # fall back to AutoModel if necessary.
         logger.info(f"Loading model {config.model_name}")
-        self.model = AutoModel.from_pretrained(
-            config.model_name,
-            torch_dtype=config.dtype,
-            device_map="auto" if "cuda" in config.device else None
-        )
+        try:
+            from transformers import AutoModelForCausalLM
+            self.model = AutoModelForCausalLM.from_pretrained(
+                config.model_name,
+                torch_dtype=config.dtype,
+                device_map="auto" if "cuda" in config.device else None
+            )
+        except Exception:
+            self.model = AutoModel.from_pretrained(
+                config.model_name,
+                torch_dtype=config.dtype,
+                device_map="auto" if "cuda" in config.device else None
+            )
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         
         # Add padding token if missing
@@ -58,9 +67,13 @@ class ActivationCapture:
             
         self.model.eval()
         
-        # Find target layer
-        self.target_layer = self._find_target_layer()
-        logger.info(f"Target layer: {self.target_layer}")
+        # Find target layer (or plan B: capture last_hidden_state directly)
+        self.target_layer = None
+        try:
+            self.target_layer = self._find_target_layer()
+            logger.info(f"Target layer: {self.target_layer}")
+        except Exception:
+            logger.warning("Falling back to capturing last_hidden_state (no explicit hook layer found).")
         
         # Storage for captured activations
         self.captured_activations = []
@@ -125,19 +138,20 @@ class ActivationCapture:
         # Clear previous captures
         self.captured_activations = []
         
-        # Register hook
-        self.hook_handle = self.target_layer.register_forward_hook(self._activation_hook)
+        # Register hook if we have a target layer; else run once and grab last_hidden_state
+        if self.target_layer is not None:
+            self.hook_handle = self.target_layer.register_forward_hook(self._activation_hook)
         
         try:
             with torch.no_grad():
-                _ = self.model(**inputs)
-            
-            # Get captured activations
+                outputs = self.model(**inputs)
             if self.captured_activations:
-                activations = self.captured_activations[0]  # Should be one batch
+                activations = self.captured_activations[0]
                 return activations
-            else:
-                raise RuntimeError("No activations were captured")
+            # Fallback: use last_hidden_state if hook approach failed
+            if hasattr(outputs, "last_hidden_state"):
+                return outputs.last_hidden_state.detach().cpu()
+            raise RuntimeError("No activations were captured")
                 
         finally:
             # Clean up hook
@@ -312,7 +326,7 @@ class ActivationCapture:
         
         with h5py.File(filepath, 'w') as f:
             for concept_id, activation_tensor in activations.items():
-                f.create_dataset(concept_id, data=activation_tensor.numpy())
+                f.create_dataset(concept_id, data=activation_tensor.to(torch.float32).numpy())
         
         logger.info(f"Saved activations for {len(activations)} concepts to {filepath}")
     
@@ -326,7 +340,7 @@ class ActivationCapture:
             for concept_id, pos_neg_dict in activations.items():
                 concept_group = f.create_group(concept_id)
                 for pos_neg, activation_tensor in pos_neg_dict.items():
-                    concept_group.create_dataset(pos_neg, data=activation_tensor.numpy())
+                    concept_group.create_dataset(pos_neg, data=activation_tensor.to(torch.float32).numpy())
         
         logger.info(f"Saved hierarchical activations for {len(activations)} concepts to {filepath}")
     

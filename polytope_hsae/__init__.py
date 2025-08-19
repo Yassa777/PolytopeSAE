@@ -17,7 +17,7 @@ from . import models
 from . import training
 from . import steering
 from . import metrics
-from . import visualization
+# from . import visualization  # Module not yet implemented
 
 __all__ = [
     "geometry",
@@ -29,5 +29,5 @@ __all__ = [
     "training",
     "steering",
     "metrics",
-    "visualization",
+    # "visualization",  # Module not yet implemented
 ]

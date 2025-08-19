@@ -42,6 +42,14 @@ class HSAEConfig:
     router_temp_start: float = 1.5
     router_temp_end: float = 0.7
     normalize_decoder: bool = True
+    top_level_beta: float = 0.1
+    
+    # JAX-compatibility toggles
+    use_tied_decoders_parent: bool = False
+    use_tied_decoders_child: bool = False
+    tie_projectors: bool = False
+    use_decoder_bias: bool = True
+    use_offdiag_biorth: bool = False  # Use off-diagonal-only cross-orthogonality
 
 
 class StandardSAE(nn.Module):
@@ -240,14 +248,24 @@ class HierarchicalSAE(nn.Module):
         """
         parent_logits = self.parent_encoder(x)
         
-        # Top-K gating with temperature
         if self.training:
-            # Gumbel softmax for differentiable top-k
-            parent_probs = F.gumbel_softmax(parent_logits, tau=self.router_temperature, hard=True)
-            # Keep only top-k
-            topk_vals, topk_indices = torch.topk(parent_logits, self.config.topk_parent, dim=-1)
-            parent_codes = torch.zeros_like(parent_logits)
-            parent_codes.scatter_(-1, topk_indices, 1.0)
+            # Add Gumbel noise for exploration
+            noise = torch.rand_like(parent_logits)
+            gumbel = -torch.log(-torch.log(noise.clamp_min(1e-8)).clamp_min(1e-8))
+            logits = parent_logits + gumbel * self.router_temperature
+
+            # Top-K mask (hard)
+            topk_vals, topk_idx = torch.topk(logits, self.config.topk_parent, dim=-1)
+            hard_mask = torch.zeros_like(parent_logits)
+            hard_mask.scatter_(-1, topk_idx, 1.0)
+
+            # Soft probs for gradient; restrict mass to Top-K
+            soft = F.softmax(parent_logits / (self.router_temperature + 1e-8), dim=-1)
+            soft_masked = soft * hard_mask
+            soft_masked = soft_masked / (soft_masked.sum(dim=-1, keepdim=True) + 1e-8)
+
+            # Straight-through estimator
+            parent_codes = (hard_mask - soft_masked).detach() + soft_masked
         else:
             # Hard top-k for inference
             topk_vals, topk_indices = torch.topk(parent_logits, self.config.topk_parent, dim=-1)
@@ -284,13 +302,34 @@ class HierarchicalSAE(nn.Module):
             child_logits_p = self.child_encoders[parent_idx](x_subspace)
             child_logits[active_mask, parent_idx] = child_logits_p
             
-            # Top-K child selection (typically K=1)
+            # Top-K child selection
             if self.config.topk_child == 1:
+                # Use Gumbel softmax for K=1 (differentiable)
                 child_codes_p = F.gumbel_softmax(child_logits_p, tau=self.router_temperature, hard=True)
             else:
-                topk_vals, topk_indices = torch.topk(child_logits_p, self.config.topk_child, dim=-1)
-                child_codes_p = torch.zeros_like(child_logits_p)
-                child_codes_p.scatter_(-1, topk_indices, 1.0)
+                # Use straight-through estimator for K>1
+                if self.training:
+                    # Add Gumbel noise
+                    noise = torch.rand_like(child_logits_p)
+                    gumbel = -torch.log(-torch.log(noise.clamp_min(1e-8)).clamp_min(1e-8))
+                    logits_child = child_logits_p + gumbel * self.router_temperature
+
+                    # Top-K mask (hard)
+                    topk_vals, topk_indices = torch.topk(logits_child, self.config.topk_child, dim=-1)
+                    hard_mask = torch.zeros_like(child_logits_p)
+                    hard_mask.scatter_(-1, topk_indices, 1.0)
+
+                    # Soft probs for gradient
+                    soft = F.softmax(child_logits_p / (self.router_temperature + 1e-8), dim=-1)
+                    soft_masked = soft * hard_mask
+                    soft_masked = soft_masked / (soft_masked.sum(dim=-1, keepdim=True) + 1e-8)
+
+                    # Straight-through estimator
+                    child_codes_p = (hard_mask - soft_masked).detach() + soft_masked
+                else:
+                    topk_vals, topk_indices = torch.topk(child_logits_p, self.config.topk_child, dim=-1)
+                    child_codes_p = torch.zeros_like(child_logits_p)
+                    child_codes_p.scatter_(-1, topk_indices, 1.0)
             
             child_codes[active_mask, parent_idx] = child_codes_p
         
@@ -310,8 +349,11 @@ class HierarchicalSAE(nn.Module):
         batch_size = parent_codes.shape[0]
         reconstruction = torch.zeros(batch_size, self.config.input_dim, device=parent_codes.device)
         
-        # Parent reconstruction
-        parent_recon = F.linear(parent_codes, self.parent_decoder.weight.t())
+        # Parent reconstruction (tied or untied)
+        if self.config.use_tied_decoders_parent:
+            parent_recon = F.linear(parent_codes, self.parent_encoder.weight)
+        else:
+            parent_recon = F.linear(parent_codes, self.parent_decoder.weight.t())
         reconstruction += parent_recon
         
         # Child reconstruction
@@ -321,16 +363,24 @@ class HierarchicalSAE(nn.Module):
             if not active_mask.any():
                 continue
             
-            # Decode child codes in subspace
+            # Decode child codes in subspace (tied or untied)
             child_codes_p = child_codes[active_mask, parent_idx]
-            child_recon_subspace = F.linear(child_codes_p, self.child_decoders[parent_idx].weight.t())
+            if self.config.use_tied_decoders_child:
+                child_recon_subspace = F.linear(child_codes_p, self.child_encoders[parent_idx].weight)
+            else:
+                child_recon_subspace = F.linear(child_codes_p, self.child_decoders[parent_idx].weight.t())
             
-            # Project back to full space
-            child_recon_full = self.up_projectors[parent_idx](child_recon_subspace)
+            # Project back to full space (tied or untied projectors)
+            if self.config.tie_projectors:
+                child_recon_full = F.linear(child_recon_subspace, self.down_projectors[parent_idx].weight)
+            else:
+                child_recon_full = self.up_projectors[parent_idx](child_recon_subspace)
+                
             reconstruction[active_mask] += child_recon_full
         
-        # Add bias
-        reconstruction += self.decoder_bias
+        # Add bias (optional)
+        if self.config.use_decoder_bias:
+            reconstruction += self.decoder_bias
         
         return reconstruction
     
@@ -351,31 +401,52 @@ class HierarchicalSAE(nn.Module):
         # Decode
         x_hat = self.decode(parent_codes, child_codes)
         
+        # Compute top-level reconstruction for baseline parity
+        if self.config.use_tied_decoders_parent:
+            parent_recon = F.linear(parent_codes, self.parent_encoder.weight)
+        else:
+            parent_recon = F.linear(parent_codes, self.parent_decoder.weight.t())
+        if self.config.use_decoder_bias:
+            parent_recon += self.decoder_bias
+            
         # Compute metrics
         metrics = {
             'reconstruction_loss': F.mse_loss(x_hat, x),
+            'top_level_recon_loss': F.mse_loss(parent_recon, x),
             'l1_parent': self.config.l1_parent * torch.mean(torch.abs(parent_codes)),
             'l1_child': self.config.l1_child * torch.mean(torch.abs(child_codes)),
             'parent_sparsity': torch.mean((parent_codes > 0).float()),
             'child_sparsity': torch.mean((child_codes > 0).float()),
             'parent_usage': torch.mean(torch.sum(parent_codes > 0, dim=0).float()),
             'child_usage': torch.mean(torch.sum(child_codes > 0, dim=(0, 1)).float()),
+            'active_parents_per_sample': torch.mean(torch.sum(parent_codes > 0, dim=1).float()),
+            'active_children_per_sample': torch.mean(torch.sum(child_codes > 0, dim=(1,2)).float()),
+            'router_temperature': self.router_temperature.item(),
         }
         
         # Bi-orthogonality penalty
         if self.config.biorth_lambda > 0:
-            biorth_penalty = 0
-            
-            # Parent bi-orthogonality: E^T D ≈ I
-            parent_enc_dec = self.parent_encoder.weight @ self.parent_decoder.weight
-            parent_identity = torch.eye(self.config.n_parents, device=x.device)
-            biorth_penalty += torch.norm(parent_enc_dec - parent_identity, 'fro') ** 2
-            
-            # Child bi-orthogonality
-            for i in range(self.config.n_parents):
-                child_enc_dec = self.child_encoders[i].weight @ self.child_decoders[i].weight
-                child_identity = torch.eye(self.config.n_children_per_parent, device=x.device)
-                biorth_penalty += torch.norm(child_enc_dec - child_identity, 'fro') ** 2
+            if self.config.use_offdiag_biorth:
+                # JAX-style: off-diagonal penalty only
+                biorth_penalty = self._biorth_penalty_parent_offdiag()
+                for i in range(self.config.n_parents):
+                    biorth_penalty += self._biorth_penalty_child_offdiag(i)
+            else:
+                # Our style: E^T D ≈ I penalty
+                biorth_penalty = 0
+                
+                # Parent bi-orthogonality: E^T D ≈ I
+                if not self.config.use_tied_decoders_parent:
+                    parent_enc_dec = self.parent_encoder.weight @ self.parent_decoder.weight
+                    parent_identity = torch.eye(self.config.n_parents, device=x.device)
+                    biorth_penalty += torch.norm(parent_enc_dec - parent_identity, 'fro') ** 2
+                
+                # Child bi-orthogonality
+                if not self.config.use_tied_decoders_child:
+                    for i in range(self.config.n_parents):
+                        child_enc_dec = self.child_encoders[i].weight @ self.child_decoders[i].weight
+                        child_identity = torch.eye(self.config.n_children_per_parent, device=x.device)
+                        biorth_penalty += torch.norm(child_enc_dec - child_identity, 'fro') ** 2
             
             metrics['biorth_penalty'] = self.config.biorth_lambda * biorth_penalty
         
@@ -429,6 +500,28 @@ class HierarchicalSAE(nn.Module):
         progress = step / total_steps
         temp = self.config.router_temp_start * (1 - progress) + self.config.router_temp_end * progress
         self.router_temperature.fill_(temp)
+    
+    def _biorth_penalty_parent_offdiag(self) -> torch.Tensor:
+        """JAX-style off-diagonal cross-orthogonality penalty for parent."""
+        E = F.normalize(self.parent_encoder.weight, dim=1)  # [P, d]
+        if self.config.use_tied_decoders_parent:
+            D = F.normalize(self.parent_encoder.weight, dim=1)  # [P, d] 
+        else:
+            D = F.normalize(self.parent_decoder.weight.t(), dim=0)  # [P, d]
+        M = E @ D.t()  # [P, P]
+        off = M - torch.diag(torch.diag(M))
+        return off.pow(2).sum() / (M.numel() - M.shape[0])
+    
+    def _biorth_penalty_child_offdiag(self, parent_idx: int) -> torch.Tensor:
+        """JAX-style off-diagonal cross-orthogonality penalty for child."""
+        E = F.normalize(self.child_encoders[parent_idx].weight, dim=1)  # [C, s]
+        if self.config.use_tied_decoders_child:
+            D = F.normalize(self.child_encoders[parent_idx].weight, dim=1)  # [C, s]
+        else:
+            D = F.normalize(self.child_decoders[parent_idx].weight.t(), dim=0)  # [C, s]
+        M = E @ D.t()  # [C, C]
+        off = M - torch.diag(torch.diag(M))
+        return off.pow(2).sum() / (M.numel() - M.shape[0])
 
 
 def create_baseline_hsae(config: HSAEConfig) -> HierarchicalSAE:

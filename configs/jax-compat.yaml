@@ -1,0 +1,111 @@
+# configs/jax-compat.yaml
+# JAX-compatible configuration for fair baseline comparison
+
+run:
+  seed: 123
+  device: cuda:0
+  budget_hours: 30
+  notes: "JAX-compatible baseline for fair comparison with their implementation"
+
+model:
+  name: google/gemma-2b
+  dtype: bf16
+  activation_hook: final_residual_pre_unembed
+  layers_probe: ["last"]
+
+data:
+  token_budget: 8_000_000
+  window_length: 128
+  shard_size_tokens: 262_144
+  source: "Wikipedia 20231101 + curated prompts"
+  unit_norm: true  # JAX-style normalization
+
+concepts:
+  ontology: wordnet
+  parents: 80
+  max_children_per_parent: 4
+  prompts_per_concept: 64
+  split: {train: 0.70, val: 0.15, test: 0.15}
+
+geometry:
+  whitening: unembedding_rows
+  shrinkage: 0.05
+  estimator:
+    type: lda
+    lda_shrinkage: 0.10
+    min_vocab_count: 50
+    class_balance: true
+
+teacher:
+  parent_vectors: "from_final_layer"
+  child_deltas: "LDA_in_parent_subspace"
+  normalize_causal: true
+
+hsae:
+  # JAX-like architecture for comparison
+  m_top: 256
+  topk_parent: 32            # JAX uses many active experts
+  subspace_dim: 4            # JAX uses very small subspaces
+  m_low: 16                  # JAX atoms per expert
+  topk_child: 1
+  projectors_init: "svd_from_teacher"
+  l1_parent: 1.0e-3
+  l1_child: 1.0e-3
+  biorth_lambda: 1.0e-1      # Stronger cross-ortho like JAX
+  causal_ortho_lambda: 0.0   # Disable our contribution for fair comparison
+  router_temp: {start: 1.0, end: 1.0}  # No temperature annealing
+  top_level_beta: 0.1
+  
+  # JAX-compatible settings
+  use_tied_decoders_parent: true   # JAX ties weights
+  use_tied_decoders_child: true    # JAX ties weights
+  tie_projectors: true             # JAX ties projectors
+  use_decoder_bias: false          # JAX typically no bias
+  use_offdiag_biorth: true         # JAX-style cross-orthogonality
+
+training:
+  optimizer: adamw
+  lr: 5.0e-4                 # JAX peak LR
+  weight_decay: 1.0e-4
+  grad_clip: 0.75            # JAX norm clipping
+  batch_size_acts: 8192
+  warmup_steps: 1000         # JAX uses warmup
+  
+  baseline:
+    total_steps: 7000
+    init_method: "random"
+  
+  teacher_init:
+    total_steps: 7000        # No two-stage for fair comparison
+    stage_A:
+      freeze_decoder: false  # No freezing for fair comparison
+      steps: 0
+      lr_mult: 1.0
+      enable_causal_ortho: false
+    stage_B:
+      freeze_decoder: false
+      steps: 7000
+      lr_mult: 1.0
+      enable_causal_ortho: false
+
+eval:
+  metrics: ["1-EV", "1-CE", "purity", "leakage", "steering_leakage"]
+  steering_layers: ["last"]
+  steering_magnitudes: [0.5, 1.0, 2.0]
+  validation:
+    angle_threshold_deg: 80
+    kl_threshold: 0.10
+    controls:
+      n_shuffles: 50
+
+ablate:
+  euclidean_vs_causal: true
+  topk_comparison: [8, 16, 32]
+  no_teacher_init: true
+  tied_vs_untied: true
+
+logging:
+  save_dir: "runs/jax_compat"
+  log_every: 50
+  checkpoint_every: 500
+  keep_last_k: 3

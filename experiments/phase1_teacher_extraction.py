@@ -26,7 +26,7 @@ from polytope_hsae.estimators import ConceptVectorEstimator, LDAEstimator, valid
 from polytope_hsae.validation import GeometryValidator
 from polytope_hsae.concepts import ConceptCurator, PromptGenerator, ConceptSplitter
 from polytope_hsae.activations import ActivationCapture, ActivationConfig
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,6 +45,17 @@ def setup_experiment(config):
     
     logger.info(f"Phase 1 experiment directory: {exp_dir}")
     return exp_dir
+
+
+def _set_all_seeds(seed: int = 123):
+    """Set all random seeds for reproducibility."""
+    import random
+    import numpy as np
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def load_or_create_concepts(config, exp_dir):
@@ -119,30 +130,23 @@ def capture_activations(config, hierarchies, exp_dir):
     return activations
 
 
-def extract_teacher_vectors(config, activations, exp_dir):
+def extract_teacher_vectors(config, hierarchies, activations, exp_dir):
     """Extract parent vectors and child deltas using LDA."""
     logger.info("Extracting teacher vectors")
     
-    # Load model to get unembedding matrix
-    model = AutoModel.from_pretrained(config['model']['name'])
+    # Use a model with an LM head so we can reliably find the unembedding & logits
+    model = AutoModelForCausalLM.from_pretrained(config['model']['name'])
     
-    # Get unembedding matrix (assuming it's the final linear layer)
-    unembedding_matrix = None
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear) and 'lm_head' in name.lower():
-            unembedding_matrix = module.weight.data
-            break
-        elif isinstance(module, torch.nn.Linear) and hasattr(module, 'weight') and module.weight.shape[0] > 10000:
-            # Likely the unembedding layer (large vocab size)
-            unembedding_matrix = module.weight.data
-            break
-    
-    if unembedding_matrix is None:
-        # Fallback: use embed_tokens transposed
-        if hasattr(model, 'embed_tokens'):
-            unembedding_matrix = model.embed_tokens.weight.data.T
-        else:
-            raise ValueError("Could not find unembedding matrix")
+    # Prefer the model's lm_head when present
+    if hasattr(model, 'lm_head') and isinstance(model.lm_head, torch.nn.Linear):
+        unembedding_matrix = model.lm_head.weight.data
+    else:
+        # fallback: tied weights or input embeddings
+        try:
+            unembedding_matrix = model.get_output_embeddings().weight.data
+        except Exception:
+            emb = model.get_input_embeddings().weight.data
+            unembedding_matrix = emb  # shape (V, d)
     
     logger.info(f"Unembedding matrix shape: {unembedding_matrix.shape}")
     
@@ -228,31 +232,36 @@ def validate_geometry(config, parent_vectors, child_deltas, geometry, exp_dir):
         threshold_degrees=config['eval']['targets']['median_angle_deg']
     )
     
-    # Compute angle statistics
-    angle_stats = compute_polytope_angles(
-        torch.stack(list(parent_vectors.values())),
-        torch.stack([
-            torch.stack(list(deltas.values())) 
-            for deltas in child_deltas.values()
-        ]),
-        geometry
-    )
+    # Handle ragged children per parent: compute per-parent, then aggregate
+    all_angles = []
+    for pid, pvec in parent_vectors.items():
+        deltas = child_deltas.get(pid, {})
+        for delt in deltas.values():
+            if torch.norm(delt) > 1e-6:
+                ang = geometry.causal_angle(pvec, delt)
+                all_angles.append(torch.rad2deg(ang).item())
+    
+    angle_stats = {
+        'median_angle_deg': torch.tensor(np.median(all_angles)) if all_angles else torch.tensor(float('nan')),
+        'mean_angle_deg': torch.tensor(np.mean(all_angles)) if all_angles else torch.tensor(float('nan')),
+        'q25_angle_deg': torch.tensor(np.percentile(all_angles, 25)) if all_angles else torch.tensor(float('nan')),
+        'q75_angle_deg': torch.tensor(np.percentile(all_angles, 75)) if all_angles else torch.tensor(float('nan')),
+    }
     
     # Run control experiments
     # Load unembedding matrix again for controls
-    model = AutoModel.from_pretrained(config['model']['name'])
-    unembedding_matrix = None
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear) and 'lm_head' in name.lower():
-            unembedding_matrix = module.weight.data
-            break
-    
-    if unembedding_matrix is not None:
-        control_results = validator.run_control_experiments(
-            parent_vectors, child_deltas, unembedding_matrix, n_shuffles=50
-        )
+    control_model = AutoModelForCausalLM.from_pretrained(config['model']['name'])
+    if hasattr(control_model, 'lm_head') and isinstance(control_model.lm_head, torch.nn.Linear):
+        control_unembedding_matrix = control_model.lm_head.weight.data
     else:
-        control_results = {"error": "Could not run controls - no unembedding matrix"}
+        try:
+            control_unembedding_matrix = control_model.get_output_embeddings().weight.data
+        except Exception:
+            control_unembedding_matrix = control_model.get_input_embeddings().weight.data
+            
+    control_results = validator.run_control_experiments(
+        parent_vectors, child_deltas, control_unembedding_matrix, n_shuffles=50
+    )
     
     # Validate orthogonality with estimator function
     orthogonality_validation = validate_orthogonality(parent_vectors, child_deltas, geometry)
@@ -285,7 +294,16 @@ def validate_geometry(config, parent_vectors, child_deltas, geometry, exp_dir):
     
     # Log key results
     logger.info(f"Median angle: {validation_results['orthogonality_test']['median_angle_deg']:.1f}°")
-    logger.info(f"Fraction above 80°: {validation_results['orthogonality_test']['fraction_above_80deg']:.3f}")
+    # Check what keys are actually available
+    ortho_test = validation_results.get('orthogonality_test', {})
+    if 'fraction_above_threshold' in ortho_test:
+        fraction_key = 'fraction_above_threshold'
+    elif 'fraction_above_80deg' in ortho_test:
+        fraction_key = 'fraction_above_80deg'
+    else:
+        fraction_key = list(ortho_test.keys())[0] if ortho_test else 'unknown'
+    
+    logger.info(f"Fraction above threshold: {ortho_test.get(fraction_key, 'N/A'):.3f}" if isinstance(ortho_test.get(fraction_key), (int, float)) else f"Available keys: {list(ortho_test.keys())}")
     logger.info(f"Validation passed: {validation_results['passes_validation']}")
     
     return validation_results
@@ -296,6 +314,7 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="Path to config file")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument("--dry-run", action="store_true", help="Run with minimal data for testing")
     
     args = parser.parse_args()
     
@@ -306,9 +325,21 @@ def main():
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
+    # Set all seeds for reproducibility
+    _set_all_seeds(config.get('run', {}).get('seed', 123))
+    
     # Override device if specified
     if args.device:
         config['run']['device'] = args.device
+    
+    # Handle dry run
+    if args.dry_run:
+        logger.info("Running in DRY RUN mode with minimal data")
+        config['concepts']['parents'] = 5  # Minimal for testing
+        config['concepts']['max_children_per_parent'] = 2
+        config['concepts']['prompts_per_concept'] = 4
+        config['data']['token_budget'] = 1000  # Very small for testing
+        config['model']['name'] = "distilgpt2"  # Use a small, available model for testing
     
     # Set up experiment
     exp_dir = setup_experiment(config)
@@ -321,7 +352,7 @@ def main():
     
     # Extract teacher vectors
     parent_vectors, child_deltas, projectors, geometry = extract_teacher_vectors(
-        config, activations, exp_dir
+        config, hierarchies, activations, exp_dir
     )
     
     # Validate geometry

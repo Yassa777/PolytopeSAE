@@ -194,10 +194,10 @@ class GeometryValidator:
                     
                     hook_handle.remove()
                     
-                    # Compute KL divergence
+                    # KL(before || after) – consistent with "preserve ratios under a move"
                     kl_div = torch.nn.functional.kl_div(
-                        torch.log(intervention_probs + 1e-8),
-                        baseline_probs,
+                        torch.log(baseline_probs + 1e-8),
+                        intervention_probs,
                         reduction='sum'
                     ).item()
                     
