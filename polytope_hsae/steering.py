@@ -6,8 +6,7 @@ with support for measuring steering precision and leakage.
 """
 
 import torch
-import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Optional, Any
 import numpy as np
 from transformers import PreTrainedModel, PreTrainedTokenizer
 import logging
@@ -43,102 +42,80 @@ class ConceptSteering:
         self.hsae_model.eval()
     
     def steer_with_parent_vector(self,
-                               prompts: List[str],
-                               parent_vector: torch.Tensor,
-                               magnitude: float = 1.0,
-                               layer_name: str = "last") -> Dict[str, Any]:
-        """
-        Steer generation using a parent concept vector.
-        
+                                 prompts: List[str],
+                                 parent_vector: torch.Tensor,
+                                 magnitude: float = 1.0,
+                                 output_layer: Optional[str] = None) -> Dict[str, Any]:
+        """Steer generation using a parent concept vector.
+
         Args:
             prompts: List of input prompts
-            parent_vector: Parent concept vector to add [input_dim]
-            magnitude: Steering magnitude
-            layer_name: Layer to apply steering to
-            
+            parent_vector: Parent concept vector to add ``[input_dim]``
+            magnitude: Steering magnitude applied to the parent vector
+            output_layer: Optional name of the model submodule that produces
+                logits. If ``None`` (default), ``model.get_output_embeddings``
+                is used.
+
         Returns:
             Dictionary with steering results
         """
+
         logger.info(f"Steering with parent vector (magnitude={magnitude})")
-        
+
         # Tokenize prompts
         inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
+
         parent_vector = parent_vector.to(self.device)
-        
-        # Get baseline logits
+
+        # Run model once to capture hidden states and baseline logits
         with torch.no_grad():
-            baseline_outputs = self.model(**inputs, output_hidden_states=True)
-            baseline_logits = baseline_outputs.logits
-        
-        # Apply steering intervention
-        def steering_hook(module, input, output):
-            if isinstance(output, tuple):
-                hidden_states = output[0]
-            else:
-                hidden_states = output
-            
-            # Add steering vector to last token
-            hidden_states[:, -1] += magnitude * parent_vector
-            
-            if isinstance(output, tuple):
-                return (hidden_states,) + output[1:]
-            else:
-                return hidden_states
-        
-        # Find target layer and register hook
-        hook_handle = None
-        if layer_name == "last":
-            # Apply to final hidden states before unembedding
-            for name, module in self.model.named_modules():
-                if hasattr(module, 'weight') and module.weight.shape[0] > 1000:  # Likely unembedding
-                    hook_handle = module.register_forward_hook(
-                        lambda m, i, o: self.model.lm_head(i[0] + magnitude * parent_vector.unsqueeze(0).unsqueeze(0))
-                    )
-                    break
-        
-        if hook_handle is None:
-            # Fallback: modify hidden states directly
-            with torch.no_grad():
-                steered_outputs = self.model(**inputs, output_hidden_states=True)
-                hidden_states = steered_outputs.hidden_states[-1]
-                hidden_states[:, -1] += magnitude * parent_vector
-                steered_logits = self.model.lm_head(hidden_states)
+            outputs = self.model(**inputs, output_hidden_states=True)
+            baseline_logits = outputs.logits
+            hidden_states = outputs.hidden_states[-1]
+
+        # Apply steering to captured hidden states
+        steered_hidden = hidden_states.clone()
+        steered_hidden[:, -1] += magnitude * parent_vector
+
+        # Determine output layer for computing logits
+        if output_layer is not None:
+            lm_head = self.model.get_submodule(output_layer)
         else:
-            with torch.no_grad():
-                steered_outputs = self.model(**inputs, output_hidden_states=True)
-                steered_logits = steered_outputs.logits
-            hook_handle.remove()
-        
-        # Compute steering effects
+            lm_head = self.model.get_output_embeddings()
+
+        with torch.no_grad():
+            steered_logits = lm_head(steered_hidden)
+
         logit_deltas = steered_logits - baseline_logits
-        
+
         return {
-            'baseline_logits': baseline_logits,
-            'steered_logits': steered_logits,
-            'logit_deltas': logit_deltas,
-            'magnitude': magnitude,
-            'prompts': prompts,
+            "baseline_logits": baseline_logits,
+            "steered_logits": steered_logits,
+            "logit_deltas": logit_deltas,
+            "magnitude": magnitude,
+            "prompts": prompts,
         }
     
     def steer_with_child_delta(self,
-                             prompts: List[str],
-                             parent_vector: torch.Tensor,
-                             child_delta: torch.Tensor,
-                             parent_magnitude: float = 1.0,
-                             child_magnitude: float = 1.0,
-                             layer_name: str = "last") -> Dict[str, Any]:
+                               prompts: List[str],
+                               parent_vector: torch.Tensor,
+                               child_delta: torch.Tensor,
+                               parent_magnitude: float = 1.0,
+                               child_magnitude: float = 1.0,
+                               output_layer: Optional[str] = None) -> Dict[str, Any]:
         """
         Steer generation using parent + child delta vectors.
         
         Args:
             prompts: List of input prompts
-            parent_vector: Parent concept vector [input_dim]
-            child_delta: Child delta vector δ_{c|p} [input_dim]
+            parent_vector: Parent concept vector ``[input_dim]``
+            child_delta: Child delta vector ``δ_{c|p} [input_dim]``
             parent_magnitude: Magnitude for parent vector
             child_magnitude: Magnitude for child delta
-            layer_name: Layer to apply steering to
+            output_layer: Optional name of the model submodule that produces
+                logits. If ``None`` (default), ``model.get_output_embeddings``
+                is used.
             
         Returns:
             Dictionary with steering results
@@ -148,61 +125,9 @@ class ConceptSteering:
         # Combined steering vector
         steering_vector = parent_magnitude * parent_vector + child_magnitude * child_delta
         
-        return self.steer_with_parent_vector(prompts, steering_vector, magnitude=1.0, layer_name=layer_name)
-    
-    def steer_with_hsae_activation(self,
-                                 prompts: List[str],
-                                 parent_idx: int,
-                                 child_idx: Optional[int] = None,
-                                 magnitude: float = 1.0) -> Dict[str, Any]:
-        """
-        Steer by directly activating H-SAE latents.
-        
-        Args:
-            prompts: List of input prompts
-            parent_idx: Parent latent to activate
-            child_idx: Child latent to activate (optional)
-            magnitude: Activation magnitude
-            
-        Returns:
-            Dictionary with steering results
-        """
-        logger.info(f"Steering with H-SAE activation: parent={parent_idx}, child={child_idx}")
-        
-        # Tokenize and get activations
-        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        # Get original activations (assuming we have them)
-        # This is a simplified version - in practice you'd need to capture activations from the model
-        with torch.no_grad():
-            # Mock activation capture - replace with actual activation capture
-            batch_size = inputs['input_ids'].shape[0]
-            input_dim = self.hsae_model.config.input_dim
-            original_activations = torch.randn(batch_size, input_dim).to(self.device)
-            
-            # Get H-SAE reconstruction
-            x_hat, (parent_codes, child_codes), metrics = self.hsae_model(original_activations)
-            
-            # Modify codes
-            modified_parent_codes = parent_codes.clone()
-            modified_child_codes = child_codes.clone()
-            
-            # Activate specific parent
-            modified_parent_codes[:, parent_idx] = magnitude
-            
-            # Activate specific child if specified
-            if child_idx is not None:
-                modified_child_codes[:, parent_idx, child_idx] = magnitude
-            
-            # Reconstruct with modified codes
-            steered_activations = self.hsae_model.decode(modified_parent_codes, modified_child_codes)
-            
-            # Compute difference
-            activation_delta = steered_activations - original_activations
-        
-        # Apply activation delta as steering (this would need proper integration with model)
-        return self.steer_with_parent_vector(prompts, activation_delta.mean(dim=0), magnitude=1.0)
+        return self.steer_with_parent_vector(
+            prompts, steering_vector, magnitude=1.0, output_layer=output_layer
+        )
     
     def evaluate_steering_precision(self,
                                   steering_results: Dict[str, Any],
@@ -340,5 +265,5 @@ def analyze_steering_results(results: Dict[str, Any]) -> Dict[str, float]:
         'n_parent_tests': len(parent_effects),
         'n_child_tests': len(child_effects),
     }
-    
+
     return summary

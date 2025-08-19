@@ -7,9 +7,11 @@ experiments to validate the geometric structure of concept hierarchies.
 
 import torch
 import numpy as np
+import pandas as pd
 from typing import Dict, List, Tuple, Any, Optional
 import logging
 from scipy import stats
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,13 @@ class GeometryValidator:
         
         angles_deg = np.array(angles_deg)
         inner_products = np.array(inner_products)
+
+        details_df = pd.DataFrame({
+            'parent_id': [p for p, _ in parent_child_pairs],
+            'child_id': [c for _, c in parent_child_pairs],
+            'angle_deg': angles_deg,
+            'inner_product': inner_products,
+        })
         
         # Compute statistics
         results = {
@@ -77,6 +86,7 @@ class GeometryValidator:
             'angles_deg': angles_deg,
             'inner_products': inner_products,
             'parent_child_pairs': parent_child_pairs,
+            'details': details_df,
             
             # Angle statistics
             'median_angle_deg': np.median(angles_deg),
@@ -139,6 +149,8 @@ class GeometryValidator:
         
         all_kl_divergences = []
         
+        kl_records = []
+
         for parent_id, contexts in test_contexts.items():
             if parent_id not in parent_vectors or parent_id not in sibling_groups:
                 continue
@@ -160,50 +172,52 @@ class GeometryValidator:
             
             parent_kls = []
             
-            for context in contexts[:10]:  # Limit contexts for compute
+            for context in tqdm(contexts[:10], desc=f"Contexts {parent_id}", leave=False):
                 # Get baseline sibling distribution
                 inputs = tokenizer(context, return_tensors='pt').to(device)
                 with torch.no_grad():
                     baseline_outputs = model(**inputs)
                     baseline_logits = baseline_outputs.logits[0, -1, sibling_ids]
                     baseline_probs = torch.softmax(baseline_logits, dim=0)
-                
+
                 context_kls = []
-                
+
                 for alpha in alpha_values:
                     # Define intervention hook
                     def intervention_hook(module, input, output):
                         output[0][:, -1] += alpha * parent_vector
                         return output
-                    
+
                     # Find and register hook
                     hook_handle = None
                     for name, module in model.named_modules():
                         if 'final' in name.lower() or 'last' in name.lower():
                             hook_handle = module.register_forward_hook(intervention_hook)
                             break
-                    
+
                     if hook_handle is None:
                         continue
-                    
+
                     # Run with intervention
                     with torch.no_grad():
                         intervention_outputs = model(**inputs)
                         intervention_logits = intervention_outputs.logits[0, -1, sibling_ids]
                         intervention_probs = torch.softmax(intervention_logits, dim=0)
-                    
+
                     hook_handle.remove()
-                    
+
                     # KL(before || after) – consistent with "preserve ratios under a move"
                     kl_div = torch.nn.functional.kl_div(
                         torch.log(baseline_probs + 1e-8),
                         intervention_probs,
                         reduction='sum'
                     ).item()
-                    
+
                     context_kls.append(kl_div)
-                
+
                 parent_kls.extend(context_kls)
+                for kl in context_kls:
+                    kl_records.append({'parent_id': parent_id, 'kl_divergence': kl})
             
             # Store results for this parent
             results['parent_results'][parent_id] = {
@@ -217,15 +231,29 @@ class GeometryValidator:
         
         # Overall statistics
         all_kl_divergences = np.array(all_kl_divergences)
-        results['overall_stats'] = {
-            'median_kl': np.median(all_kl_divergences),
-            'mean_kl': np.mean(all_kl_divergences),
-            'std_kl': np.std(all_kl_divergences),
-            'q90_kl': np.percentile(all_kl_divergences, 90),
-            'fraction_below_threshold': np.mean(all_kl_divergences < kl_threshold),
-            'fraction_below_020': np.mean(all_kl_divergences < 0.20),
-        }
-        
+        if len(all_kl_divergences) > 0:
+            overall_stats = {
+                'median_kl': np.median(all_kl_divergences),
+                'mean_kl': np.mean(all_kl_divergences),
+                'std_kl': np.std(all_kl_divergences),
+                'q90_kl': np.percentile(all_kl_divergences, 90),
+                'fraction_below_threshold': np.mean(all_kl_divergences < kl_threshold),
+                'fraction_below_020': np.mean(all_kl_divergences < 0.20),
+            }
+        else:
+            overall_stats = {
+                'median_kl': 0.0,
+                'mean_kl': 0.0,
+                'std_kl': 0.0,
+                'q90_kl': 0.0,
+                'fraction_below_threshold': 0.0,
+                'fraction_below_020': 0.0,
+            }
+
+        results['overall_stats'] = overall_stats
+
+        results['kl_divergences'] = pd.DataFrame(kl_records)
+
         return results
     
     def run_control_experiments(self,
@@ -252,74 +280,53 @@ class GeometryValidator:
             'random_parent_replacement': [],
             'label_permutation': []
         }
-        
+
         # Original orthogonality scores
         original_orthogonality = self.test_hierarchical_orthogonality(parent_vectors, child_deltas)
         original_median_angle = original_orthogonality['median_angle_deg']
-        
-        for shuffle_idx in range(n_shuffles):
-            if shuffle_idx % 20 == 0:
-                logger.info(f"Control shuffle {shuffle_idx}/{n_shuffles}")
-            
+
+        # Cache parent/delta pairs for vectorized computations
+        pair_parents = []
+        pair_deltas = []
+        for parent_id, deltas in child_deltas.items():
+            if parent_id not in parent_vectors:
+                continue
+            for delta in deltas.values():
+                if torch.norm(delta) > 1e-6:
+                    pair_parents.append(parent_vectors[parent_id])
+                    pair_deltas.append(delta)
+
+        if pair_parents:
+            parent_stack = torch.stack(pair_parents)
+            delta_stack = torch.stack(pair_deltas)
+        else:
+            parent_stack = torch.empty(0, unembedding_matrix.shape[1])
+            delta_stack = torch.empty(0, unembedding_matrix.shape[1])
+
+        parent_tensor = torch.stack(list(parent_vectors.values())) if parent_vectors else torch.empty(0, unembedding_matrix.shape[1])
+
+        for _ in tqdm(range(n_shuffles), desc="Control shuffles"):
             # Control 1: Shuffled unembedding rows
             shuffled_U = unembedding_matrix[torch.randperm(unembedding_matrix.shape[0])]
             shuffled_geometry = self.geometry.__class__(shuffled_U, self.geometry.shrinkage)
-            
-            # Re-compute parent vectors with shuffled geometry (using same activations)
-            # Note: This is a simplified version - in practice you'd re-run the full estimation
-            shuffled_angles = []
-            for parent_id, deltas in child_deltas.items():
-                if parent_id not in parent_vectors:
-                    continue
-                parent_vector = parent_vectors[parent_id]
-                for child_id, delta in deltas.items():
-                    if torch.norm(delta) > 1e-6:
-                        angle = shuffled_geometry.causal_angle(parent_vector, delta)
-                        shuffled_angles.append(torch.rad2deg(angle).item())
-            
-            if shuffled_angles:
-                results['shuffled_unembedding'].append(np.median(shuffled_angles))
-            
+
+            if len(parent_stack) > 0:
+                angles = torch.rad2deg(shuffled_geometry.causal_angle(parent_stack, delta_stack)).cpu().numpy()
+                results['shuffled_unembedding'].append(np.median(angles))
+
             # Control 2: Random parent replacement
-            parent_ids = list(parent_vectors.keys())
-            if len(parent_ids) >= 2:
-                # Randomly reassign parent vectors
-                shuffled_parent_ids = parent_ids.copy()
-                np.random.shuffle(shuffled_parent_ids)
-                
-                random_angles = []
-                for i, parent_id in enumerate(parent_ids):
-                    if parent_id in child_deltas:
-                        # Use shuffled parent vector
-                        random_parent = parent_vectors[shuffled_parent_ids[i]]
-                        for child_id, delta in child_deltas[parent_id].items():
-                            if torch.norm(delta) > 1e-6:
-                                angle = self.geometry.causal_angle(random_parent, delta)
-                                random_angles.append(torch.rad2deg(angle).item())
-                
-                if random_angles:
-                    results['random_parent_replacement'].append(np.median(random_angles))
-            
-            # Control 3: Label permutation (simplified)
-            # This would require re-running estimation with permuted labels
-            # For now, we'll use a proxy by randomly pairing parent vectors with child deltas
-            all_deltas = []
-            for deltas in child_deltas.values():
-                all_deltas.extend(list(deltas.values()))
-            
-            if len(all_deltas) > 0 and len(parent_vectors) > 0:
-                parent_list = list(parent_vectors.values())
-                permuted_angles = []
-                
-                for _ in range(min(20, len(all_deltas))):  # Sample some pairs
-                    random_parent = parent_list[np.random.randint(len(parent_list))]
-                    random_delta = all_deltas[np.random.randint(len(all_deltas))]
-                    if torch.norm(random_delta) > 1e-6:
-                        angle = self.geometry.causal_angle(random_parent, random_delta)
-                        permuted_angles.append(torch.rad2deg(angle).item())
-                
-                if permuted_angles:
-                    results['label_permutation'].append(np.median(permuted_angles))
+            if len(parent_tensor) >= 2 and len(delta_stack) > 0:
+                rand_idx = torch.randint(len(parent_tensor), (len(delta_stack),))
+                rand_parents = parent_tensor[rand_idx]
+                angles = torch.rad2deg(self.geometry.causal_angle(rand_parents, delta_stack)).cpu().numpy()
+                results['random_parent_replacement'].append(np.median(angles))
+
+            # Control 3: Label permutation - pair random parents with random deltas
+            if len(parent_tensor) > 0 and len(delta_stack) > 0:
+                rand_parents = parent_tensor[torch.randint(len(parent_tensor), (len(delta_stack),))]
+                rand_deltas = delta_stack[torch.randint(len(delta_stack), (len(delta_stack),))]
+                angles = torch.rad2deg(self.geometry.causal_angle(rand_parents, rand_deltas)).cpu().numpy()
+                results['label_permutation'].append(np.median(angles))
         
         # Compute summary statistics for controls
         summary = {
