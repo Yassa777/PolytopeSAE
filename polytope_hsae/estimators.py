@@ -12,6 +12,7 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.covariance import LedoitWolf
 from typing import Tuple, Optional, Dict, List, Any
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -90,50 +91,60 @@ class LDAEstimator:
         direction_original = direction @ geometry.W.T  # W^T maps whitened back to original
         return geometry.normalize_causal(direction_original)
     
-    def estimate_multiclass_directions(self,
-                                     X_list: List[torch.Tensor],
-                                     geometry,
-                                     method: str = 'one_vs_rest') -> torch.Tensor:
-        """
-        Estimate directions for multiclass classification.
-        
+    def estimate_multiclass_directions(
+        self,
+        X_list: List[torch.Tensor],
+        geometry,
+        method: str = "one_vs_rest",
+    ) -> torch.Tensor:
+        """Estimate directions for multiclass classification.
+
+        This routine mixes PyTorch operations with scikit-learn's LDA
+        implementation. Inputs are expected to be ``torch.Tensor`` objects and
+        are converted to ``numpy`` arrays where required. The conversion uses
+        ``to(torch.float32).cpu().numpy()`` to avoid dtype surprises. For
+        deterministic behaviour the numpy random seed is fixed.
+
         Args:
-            X_list: List of tensors, one per class [N_i, d]
-            geometry: CausalGeometry instance
-            method: 'one_vs_rest' or 'pairwise'
-            
+            X_list: List of tensors, one per class ``[N_i, d]``.
+            geometry: CausalGeometry instance.
+            method: ``'one_vs_rest'`` or ``'pairwise'``.
+
         Returns:
-            Matrix of class directions [n_classes, d]
+            Matrix of class directions ``[n_classes, d]``.
         """
         n_classes = len(X_list)
         d = X_list[0].shape[1]
         directions = torch.zeros(n_classes, d)
-        
-        if method == 'one_vs_rest':
+
+        if method == "one_vs_rest":
             for i, X_pos in enumerate(X_list):
-                # Combine all other classes as negative
                 X_neg = torch.cat([X_list[j] for j in range(n_classes) if j != i], dim=0)
                 directions[i] = self.estimate_binary_direction(X_pos, X_neg, geometry)
-                
-        elif method == 'pairwise':
+
+        elif method == "pairwise":
             # Use sklearn's LDA for multiclass
             X_all = torch.cat(X_list, dim=0)
             y_all = torch.cat([torch.full((len(X_list[i]),), i) for i in range(n_classes)])
-            
+
             # Whiten data
             X_whitened = geometry.whiten(X_all)
-            
+
+            # Ensure deterministic behaviour in scikit-learn
+            np.random.seed(0)
+
             # Fit LDA with proper solver for shrinkage
-            lda = LinearDiscriminantAnalysis(solver='eigen', shrinkage=self.shrinkage)
-            lda.fit(X_whitened.to(dtype=torch.float32).cpu().numpy(),
-                    y_all.cpu().numpy())
-            
-            # Extract directions and transform back
+            lda = LinearDiscriminantAnalysis(solver="eigen", shrinkage=self.shrinkage)
+            lda.fit(
+                X_whitened.to(dtype=torch.float32).cpu().numpy(),
+                y_all.to(dtype=torch.int64).cpu().numpy(),
+            )
+
             for i in range(n_classes):
                 direction_whitened = torch.from_numpy(lda.coef_[i]).float()
                 direction_original = direction_whitened @ geometry.W.T
                 directions[i] = geometry.normalize_causal(direction_original)
-        
+
         return directions
 
 
@@ -179,9 +190,11 @@ class ConceptVectorEstimator:
             
         return parent_vectors
     
-    def estimate_child_deltas(self,
-                            parent_vectors: Dict[str, torch.Tensor],
-                            child_activations: Dict[str, Dict[str, Dict[str, torch.Tensor]]]) -> Dict[str, Dict[str, torch.Tensor]]:
+    def estimate_child_deltas(
+        self,
+        parent_vectors: Dict[str, torch.Tensor],
+        child_activations: Dict[str, Dict[str, Dict[str, torch.Tensor]]],
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
         """
         Estimate child delta vectors δ_{c|p} = ℓ_c - ℓ_p.
         
@@ -264,78 +277,92 @@ class ConceptVectorEstimator:
         return projectors
 
 
-def ridge_cross_layer_mapping(source_vectors: torch.Tensor,
-                            target_vectors: torch.Tensor,
-                            alpha: float = 1.0) -> torch.Tensor:
-    """
-    Learn ridge regression mapping from source layer to target layer.
-    
+def ridge_cross_layer_mapping(
+    source_vectors: torch.Tensor,
+    target_vectors: torch.Tensor,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Learn ridge regression mapping from source layer to target layer.
+
+    The inputs are cast to ``float32`` prior to solving to ensure numerical
+    stability. If the regularized system is ill-conditioned, a pseudoinverse is
+    used instead of the standard solve.
+
     Args:
-        source_vectors: Vectors in source layer [n_concepts, d_source]
-        target_vectors: Corresponding vectors in target layer [n_concepts, d_target]
+        source_vectors: Vectors in source layer ``[n_concepts, d_source]``
+        target_vectors: Corresponding vectors in target layer
+            ``[n_concepts, d_target]``
         alpha: Ridge regularization parameter
-        
+
     Returns:
-        Mapping matrix [d_target, d_source]
+        Mapping matrix ``[d_target, d_source]``
     """
-    # Ridge regression: W = (X^T X + αI)^{-1} X^T Y
-    # where X = source_vectors, Y = target_vectors
-    
-    X = source_vectors  # [n, d_source]
-    Y = target_vectors  # [n, d_target]
-    
-    # Add regularization
-    XTX = X.T @ X + alpha * torch.eye(X.shape[1])
+
+    X = source_vectors.to(torch.float32)
+    Y = target_vectors.to(torch.float32)
+
+    XTX = X.T @ X + alpha * torch.eye(X.shape[1], dtype=torch.float32)
     XTY = X.T @ Y
-    
-    # Solve for mapping
-    W = torch.linalg.solve(XTX, XTY).T  # [d_target, d_source]
-    
-    return W
+
+    try:
+        W = torch.linalg.solve(XTX, XTY)
+    except torch.linalg.LinAlgError:
+        logger.warning("Ill-conditioned matrix in ridge mapping; using pseudoinverse")
+        W = torch.linalg.pinv(XTX) @ XTY
+
+    return W.T
 
 
 def validate_orthogonality(parent_vectors: Dict[str, torch.Tensor],
                          child_deltas: Dict[str, Dict[str, torch.Tensor]],
-                         geometry) -> Dict[str, Any]:
-    """
-    Validate hierarchical orthogonality: ⟨ℓ_p, δ_{c|p}⟩_c ≈ 0.
-    
-    Args:
-        parent_vectors: Parent concept vectors
-        child_deltas: Child delta vectors
-        geometry: CausalGeometry instance
-        
-    Returns:
-        Dictionary with orthogonality statistics
-    """
-    inner_products = []
-    angles = []
-    
+                         geometry) -> "OrthogonalityStats":
+    """Validate hierarchical orthogonality: ⟨ℓ_p, δ_{c|p}⟩_c ≈ 0."""
+
+    inner_products: List[float] = []
+    angles: List[float] = []
+
     for parent_id, deltas in child_deltas.items():
         if parent_id not in parent_vectors:
             continue
-            
+
         parent_vector = parent_vectors[parent_id]
-        
+
         for child_id, delta in deltas.items():
-            # Compute causal inner product
             inner_prod = geometry.causal_inner_product(parent_vector, delta)
             inner_products.append(inner_prod.item())
-            
-            # Compute angle
             angle = geometry.causal_angle(parent_vector, delta)
             angles.append(torch.rad2deg(angle).item())
-    
-    inner_products = np.array(inner_products)
-    angles = np.array(angles)
-    
-    return {
-        'inner_products': inner_products,
-        'angles_deg': angles,
-        'mean_inner_product': np.mean(np.abs(inner_products)),
-        'median_angle_deg': np.median(angles),
-        'q25_angle_deg': np.percentile(angles, 25),
-        'q75_angle_deg': np.percentile(angles, 75),
-        'fraction_orthogonal_80deg': np.mean(angles > 80),
-        'fraction_orthogonal_85deg': np.mean(angles > 85),
-    }
+
+    inner_products_arr = np.array(inner_products)
+    angles_arr = np.array(angles)
+
+    stats = OrthogonalityStats(
+        inner_products=inner_products_arr,
+        angles_deg=angles_arr,
+        mean_inner_product=np.mean(np.abs(inner_products_arr)) if inner_products_arr.size else 0.0,
+        median_angle_deg=np.median(angles_arr) if angles_arr.size else 0.0,
+        q25_angle_deg=np.percentile(angles_arr, 25) if angles_arr.size else 0.0,
+        q75_angle_deg=np.percentile(angles_arr, 75) if angles_arr.size else 0.0,
+        fraction_orthogonal_80deg=np.mean(angles_arr > 80) if angles_arr.size else 0.0,
+        fraction_orthogonal_85deg=np.mean(angles_arr > 85) if angles_arr.size else 0.0,
+    )
+    stats.validate()
+    return stats
+
+
+@dataclass
+class OrthogonalityStats:
+    """Container for orthogonality statistics with basic validation."""
+
+    inner_products: np.ndarray
+    angles_deg: np.ndarray
+    mean_inner_product: float
+    median_angle_deg: float
+    q25_angle_deg: float
+    q75_angle_deg: float
+    fraction_orthogonal_80deg: float
+    fraction_orthogonal_85deg: float
+
+    def validate(self) -> None:
+        if self.inner_products.shape != self.angles_deg.shape:
+            raise ValueError("Mismatched shapes for inner products and angles")

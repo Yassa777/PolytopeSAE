@@ -1,0 +1,48 @@
+{
+  "positive": [
+    "The {concept} is",
+    "A {concept} can",
+    "Every {concept} has",
+    "This {concept} will",
+    "The typical {concept} is",
+    "A good {concept} should",
+    "When you see a {concept}, you",
+    "The {concept} in the picture",
+    "My favorite {concept} is",
+    "The best {concept} I know",
+    "A {concept} always",
+    "The {concept} that I saw",
+    "This particular {concept} is",
+    "A {concept} like this",
+    "The {concept} here is",
+    "Such a {concept} would",
+    "A {concept} of this type",
+    "The {concept} shown is",
+    "This kind of {concept} is",
+    "A {concept} similar to this"
+  ],
+  "negative": [
+    "This is not a {concept}",
+    "Unlike a {concept}, this",
+    "This lacks the properties of a {concept}",
+    "This cannot be considered a {concept}",
+    "This is the opposite of a {concept}",
+    "This has nothing to do with {concept}",
+    "This is unrelated to any {concept}",
+    "This doesn't resemble a {concept}",
+    "This is clearly not a {concept}",
+    "This is different from a {concept}"
+  ],
+  "contextual": [
+    "In the story, the {concept} was",
+    "During the experiment, the {concept} showed",
+    "According to the expert, this {concept} is",
+    "In nature, a {concept} typically",
+    "The scientist studied the {concept} and found",
+    "The child pointed at the {concept} and said",
+    "In the museum, the {concept} was displayed",
+    "The book described the {concept} as",
+    "The documentary showed how the {concept} can",
+    "In this example, the {concept} demonstrates"
+  ]
+}

@@ -7,24 +7,24 @@ for the polytope discovery experiments.
 
 import nltk
 from nltk.corpus import wordnet as wn
-import torch
 from typing import Dict, List, Tuple, Set, Any, Optional
 import json
 import random
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from functools import lru_cache
 
-# Download required NLTK data
-try:
-    nltk.data.find('corpora/wordnet')
-except LookupError:
-    nltk.download('wordnet')
+# NLTK setup is performed lazily via ``setup_nltk`` to avoid network calls on
+# module import.
 
-try:
-    nltk.data.find('corpora/omw-1.4')
-except LookupError:
-    nltk.download('omw-1.4')
+def setup_nltk() -> None:
+    """Download required NLTK corpora if missing."""
+    for corpus in ["wordnet", "omw-1.4"]:
+        try:
+            nltk.data.find(f"corpora/{corpus}")
+        except LookupError:
+            nltk.download(corpus)
 
 logger = logging.getLogger(__name__)
 
@@ -70,17 +70,30 @@ class ConceptCurator:
         self.max_children_per_parent = max_children_per_parent
         self.min_children_per_parent = min_children_per_parent
         self.pos_filter = pos_filter or {'n', 'v'}  # nouns and verbs by default
-        
-    def get_concept_info(self, synset) -> ConceptInfo:
-        """Extract information from a WordNet synset."""
+
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _concept_info_from_id(synset_id: str) -> ConceptInfo:
+        """Cached extraction of :class:`ConceptInfo` from a synset id."""
+        synset = wn.synset(synset_id)
         return ConceptInfo(
             synset_id=synset.name(),
             name=synset.lemmas()[0].name().replace('_', ' '),
             definition=synset.definition(),
             examples=synset.examples(),
             pos=synset.pos(),
-            lemmas=[lemma.name().replace('_', ' ') for lemma in synset.lemmas()]
+            lemmas=[lemma.name().replace('_', ' ') for lemma in synset.lemmas()],
         )
+
+    def get_concept_info(self, synset) -> ConceptInfo:
+        """Extract information from a WordNet synset using cached lookups."""
+        return self._concept_info_from_id(synset.name())
+
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _synset_from_id(synset_id: str):
+        """Cached lookup of a WordNet synset."""
+        return wn.synset(synset_id)
     
     def select_parent_concepts(self) -> List[ConceptInfo]:
         """
@@ -135,7 +148,7 @@ class ConceptCurator:
         Returns:
             List of child ConceptInfo objects
         """
-        parent_synset = wn.synset(parent_synset_id)
+        parent_synset = self._synset_from_id(parent_synset_id)
         children_synsets = parent_synset.hyponyms()
         
         # Score children by clarity and distinctiveness
@@ -188,66 +201,30 @@ class ConceptCurator:
 
 class PromptGenerator:
     """Generates prompts for concept activation."""
-    
-    def __init__(self, prompts_per_concept: int = 64):
-        """
-        Initialize prompt generator.
-        
+
+    def __init__(
+        self,
+        prompts_per_concept: int = 64,
+        template_path: Optional[str] = None,
+    ):
+        """Initialize prompt generator.
+
         Args:
-            prompts_per_concept: Number of prompts to generate per concept
+            prompts_per_concept: Number of prompts to generate per concept.
+            template_path: Optional path to a JSON file containing prompt
+                templates. If not provided, ``prompt_templates.json`` next to
+                this module is used.
         """
         self.prompts_per_concept = prompts_per_concept
-        
-        # Template categories
-        self.positive_templates = [
-            "The {concept} is",
-            "A {concept} can",
-            "Every {concept} has",
-            "This {concept} will",
-            "The typical {concept} is",
-            "A good {concept} should",
-            "When you see a {concept}, you",
-            "The {concept} in the picture",
-            "My favorite {concept} is",
-            "The best {concept} I know",
-            "A {concept} always",
-            "The {concept} that I saw",
-            "This particular {concept} is",
-            "A {concept} like this",
-            "The {concept} here is",
-            "Such a {concept} would",
-            "A {concept} of this type",
-            "The {concept} shown is",
-            "This kind of {concept} is",
-            "A {concept} similar to this",
-        ]
-        
-        self.negative_templates = [
-            "This is not a {concept}",
-            "Unlike a {concept}, this",
-            "This lacks the properties of a {concept}",
-            "This cannot be considered a {concept}",
-            "This is the opposite of a {concept}",
-            "This has nothing to do with {concept}",
-            "This is unrelated to any {concept}",
-            "This doesn't resemble a {concept}",
-            "This is clearly not a {concept}",
-            "This is different from a {concept}",
-        ]
-        
-        # Context-rich templates
-        self.contextual_templates = [
-            "In the story, the {concept} was",
-            "During the experiment, the {concept} showed",
-            "According to the expert, this {concept} is",
-            "In nature, a {concept} typically",
-            "The scientist studied the {concept} and found",
-            "The child pointed at the {concept} and said",
-            "In the museum, the {concept} was displayed",
-            "The book described the {concept} as",
-            "The documentary showed how the {concept} can",
-            "In this example, the {concept} demonstrates",
-        ]
+
+        path = Path(template_path) if template_path else Path(__file__).with_name(
+            "prompt_templates.json"
+        )
+        with open(path, "r") as f:
+            templates = json.load(f)
+        self.positive_templates = templates.get("positive", [])
+        self.negative_templates = templates.get("negative", [])
+        self.contextual_templates = templates.get("contextual", [])
     
     def generate_prompts_for_concept(self, concept: ConceptInfo, is_positive: bool = True) -> List[str]:
         """
