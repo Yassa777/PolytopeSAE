@@ -32,12 +32,19 @@ geometry:
   shrinkage: 0.1
 
 hsae:
-  n_parents: 16  # Small model
+  m_top: 16  # Number of parent latents
+  m_low: 8   # Number of children per parent  
   subspace_dim: 32  # Reduced
   topk_parent: 4
   topk_child: 1
   l1_parent: 1.0e-3
   l1_child: 1.0e-4
+  biorth_lambda: 1.0e-2
+  causal_ortho_lambda: 1.0e-3
+  router_temp:
+    start: 1.5
+    end: 1.0
+  top_level_beta: 0.1
   use_tied_decoders_parent: false
   use_tied_decoders_child: false
   tie_projectors: false
