@@ -481,25 +481,10 @@ class ActivationCapture:
         )
         return activations
 
-    def load_hierarchical_activations(
-        self, filepath: str
-    ) -> Dict[str, Dict[str, torch.Tensor]]:
-        """Load hierarchical activations from HDF5 file."""
-        activations: Dict[str, Dict[str, torch.Tensor]] = {}
-
-        with h5py.File(filepath, "r") as f:
-            for concept_id in f.keys():
-                concept_group = f[concept_id]
-                activations[concept_id] = {}
-                for pos_neg in concept_group.keys():
-                    activations[concept_id][pos_neg] = torch.from_numpy(
-                        concept_group[pos_neg][:]
-                    )
-
-        logger.info(
-            f"Loaded hierarchical activations for {len(activations)} concepts from {filepath}"
-        )
-        return activations
+    # Instance method removed - use static method instead
+    # def load_hierarchical_activations(self, filepath: str) -> Dict[str, Dict[str, torch.Tensor]]:
+    #     """Load hierarchical activations from HDF5 file."""
+    #     return ActivationCapture.load_hierarchical_activations(filepath)
 
 
 def create_activation_shards(
