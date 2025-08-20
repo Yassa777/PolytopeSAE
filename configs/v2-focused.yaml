@@ -8,7 +8,7 @@ run:
   notes: "V2 focused experiment: teacher extraction + baseline vs teacher-init H-SAE comparison"
 
 model:
-  name: google/gemma-2b  # or gemma-2b
+  name: google/gemma-2-2b  # Gemma 2.0 2B parameters
   dtype: bf16
   activation_hook: final_residual_pre_unembed
   layers_probe: ["last"]  # Single late layer only

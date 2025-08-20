@@ -8,7 +8,7 @@ run:
   notes: "JAX-compatible baseline for fair comparison with their implementation"
 
 model:
-  name: google/gemma-2b
+  name: google/gemma-2-2b
   dtype: bf16
   activation_hook: final_residual_pre_unembed
   layers_probe: ["last"]

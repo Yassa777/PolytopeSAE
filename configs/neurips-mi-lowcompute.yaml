@@ -6,7 +6,7 @@ run:
   notes: "One-layer Phase-2 (paper H-SAE) + Phase-3 (teacher-init H-SAE)."
 
 model:
-  name: gemma-2b-it
+  name: google/gemma-2-2b
   dtype: bf16
   activation_hook: final_residual_pre_unembed  # λ(x) just before unembedding
   layers_probe: ["last"]                        # single layer to cap compute
