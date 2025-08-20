@@ -86,5 +86,6 @@ logging:
   phase_2_log: v2_focused/baseline_hsae
   phase_3_log: v2_focused/teacher_hsae
   phase_4_log: v2_focused/evaluation
+  log_every: 50  # Log every 50 steps
 
 wandb_project: "polytope-hsae"
