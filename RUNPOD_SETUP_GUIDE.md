@@ -1,5 +1,47 @@
 # 🚀 RunPod Setup Guide - Ready for 25-30 Hour Experiment
 
+## ⚡ **QUICK START - Robust Installation**
+
+### **Method 1: Automated Robust Setup (Recommended)**
+```bash
+# Download and run the robust setup script
+wget https://raw.githubusercontent.com/Yassa777/PolytopeSAE/main/runpod_robust_setup.sh
+chmod +x runpod_robust_setup.sh
+./runpod_robust_setup.sh
+```
+
+### **Method 2: Manual Setup with Timeout Handling**
+```bash
+# Clone repository
+git clone https://github.com/Yassa777/PolytopeSAE.git
+cd PolytopeSAE
+
+# Install with increased timeout and retries
+pip install --timeout 300 --retries 5 -e .
+
+# If that fails, try minimal requirements
+pip install --timeout 300 --retries 5 -r requirements-minimal.txt
+pip install -e .
+```
+
+### **Method 3: Emergency Installation (If pip keeps timing out)**
+```bash
+# Use the emergency Python installer
+python emergency_install.py
+```
+
+### **Method 4: Individual Package Installation**
+```bash
+# Install core packages one by one to avoid timeouts
+pip install --timeout 300 --retries 5 torch>=2.1.0
+pip install --timeout 300 --retries 5 transformers>=4.41.0
+pip install --timeout 300 --retries 5 accelerate>=0.28.0
+# ... continue with other packages
+pip install -e .
+```
+
+---
+
 ## 🔥 **Environment Variables for RunPod**
 
 Set these environment variables in your RunPod container:
