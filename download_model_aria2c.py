@@ -24,19 +24,44 @@ def get_model_files(repo_id: str) -> List[Dict]:
         
         for sibling in repo_info.siblings:
             if not sibling.rfilename.startswith('.'):  # Skip hidden files
+                file_size = getattr(sibling, 'size', None)
+                if file_size is None:
+                    file_size = 0  # Default to 0 if size is None
+                
                 files.append({
                     'filename': sibling.rfilename,
-                    'size': getattr(sibling, 'size', 0),
+                    'size': file_size,
                     'url': f"https://huggingface.co/{repo_id}/resolve/main/{sibling.rfilename}"
                 })
         
-        # Sort by size (download small files first)
-        files.sort(key=lambda x: x['size'])
+        # Sort by size (download small files first), handle None values
+        files.sort(key=lambda x: x['size'] if x['size'] is not None else 0)
         return files
         
     except Exception as e:
         print(f"❌ Error getting file list: {e}")
-        return []
+        print("🔄 Using fallback file list...")
+        
+        # Fallback: common HuggingFace model files
+        common_files = [
+            'config.json',
+            'tokenizer.json', 
+            'tokenizer_config.json',
+            'vocab.json',
+            'merges.txt',
+            'pytorch_model.bin'
+        ]
+        
+        files = []
+        for filename in common_files:
+            files.append({
+                'filename': filename,
+                'size': 0,  # Unknown size
+                'url': f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+            })
+        
+        print(f"📋 Using {len(files)} common files")
+        return files
 
 def download_with_aria2c(url: str, output_path: str, connections: int = 8, max_retries: int = 5) -> bool:
     """Download file using aria2c with multiple connections."""
