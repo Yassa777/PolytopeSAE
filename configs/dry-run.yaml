@@ -54,6 +54,7 @@ hsae:
 training:
   batch_size_acts: 256  # Small batches
   lr: 1.0e-3
+  weight_decay: 0.0  # No weight decay for dry run
   warmup_steps: 50
   grad_clip: 1.0
   
