@@ -1,0 +1,82 @@
+# configs/dry-run.yaml
+# Quick dry run configuration with smaller model and reduced parameters
+
+run:
+  seed: 123
+  device: cuda:0
+  budget_hours: 1
+  notes: "Quick dry run with distilgpt2 for testing"
+
+model:
+  name: distilgpt2  # Small 82M parameter model
+  dtype: float32
+  activation_hook: final_residual_pre_unembed
+  layers_probe: ["last"]
+
+data:
+  token_budget: 100_000  # Very small for dry run
+  window_length: 64
+  shard_size_tokens: 8_192
+  source: "Wikipedia 20231101 + curated prompts"
+  unit_norm: true
+
+concepts:
+  n_hierarchies: 3  # Very few concepts for speed
+  n_children_per_parent: 2
+  concept_sets:
+    - "animals"
+    - "colors" 
+    - "emotions"
+
+geometry:
+  shrinkage: 0.1
+
+hsae:
+  n_parents: 16  # Small model
+  subspace_dim: 32  # Reduced
+  topk_parent: 4
+  topk_child: 1
+  l1_parent: 1.0e-3
+  l1_child: 1.0e-4
+  use_tied_decoders_parent: false
+  use_tied_decoders_child: false
+  tie_projectors: false
+  use_decoder_bias: true
+  use_offdiag_biorth: false
+
+training:
+  batch_size_acts: 256  # Small batches
+  lr: 1.0e-3
+  warmup_steps: 50
+  grad_clip: 1.0
+  
+  baseline:
+    total_steps: 500  # Very short training
+  
+  teacher_init:
+    stage_A:
+      steps: 200  # Stage A: freeze decoders
+      freeze_decoders: true
+    stage_B:
+      steps: 300  # Stage B: adapt both
+      freeze_decoders: false
+  
+  top_level_beta: 0.1
+
+regularizers:
+  biorth_lambda: 1.0e-2
+  causal_ortho_lambda: 1.0e-3
+
+eval:
+  batch_size: 128
+  targets:
+    median_angle_deg: 80.0
+    
+logging:
+  save_dir: runs
+  phase_1_log: v2_focused/teacher_extraction
+  phase_2_log: v2_focused/baseline_hsae
+  phase_3_log: v2_focused/teacher_hsae
+  phase_4_log: v2_focused/evaluation
+
+wandb_project: "polytope-hsae"
