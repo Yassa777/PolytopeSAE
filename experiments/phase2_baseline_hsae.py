@@ -174,11 +174,55 @@ def train_baseline_hsae(model, activations, config, exp_dir):
 
     # Final evaluation
     logger.info("Running final evaluation")
-    final_metrics = compute_comprehensive_metrics(
-        model=model, data_loader=val_loader, device=str(device)
-    )
-
-    log_metrics_summary(final_metrics, logger)
+    try:
+        final_metrics = compute_comprehensive_metrics(
+            model=model, data_loader=val_loader, device=str(device)
+        )
+        logger.info("✅ Comprehensive metrics computed successfully")
+        
+        # Log key metrics
+        logger.info(f"Final EV: {1.0 - final_metrics.get('1-EV', 1.0):.4f}")
+        logger.info(f"Final CE proxy: {final_metrics.get('1-CE', 0.0):.4f}")
+        logger.info(f"Parent sparsity: {final_metrics.get('parent_sparsity', 0.0):.4f}")
+        logger.info(f"Child sparsity: {final_metrics.get('child_sparsity', 0.0):.4f}")
+        
+        log_metrics_summary(final_metrics, logger)
+    except Exception as e:
+        logger.error(f"❌ Failed to compute comprehensive metrics: {e}")
+        logger.error("Computing basic metrics instead...")
+        
+        # Fallback: compute basic metrics manually
+        model.eval()
+        total_ev = 0
+        total_ce = 0
+        n_batches = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                if isinstance(batch, (list, tuple)):
+                    batch_data = batch[0].to(device)
+                else:
+                    batch_data = batch.to(device)
+                
+                x_hat, (parent_codes, child_codes), model_metrics = model(batch_data)
+                
+                from polytope_hsae.metrics import compute_explained_variance, compute_cross_entropy_proxy
+                ev = compute_explained_variance(batch_data, x_hat)
+                ce = compute_cross_entropy_proxy(batch_data, x_hat)
+                
+                total_ev += ev
+                total_ce += ce
+                n_batches += 1
+        
+        final_metrics = {
+            "1-EV": 1.0 - (total_ev / n_batches),
+            "1-CE": total_ce / n_batches,
+            "parent_sparsity": torch.mean((parent_codes > 0).float()).item(),
+            "child_sparsity": torch.mean((child_codes > 0).float()).item(),
+        }
+        
+        logger.info(f"Fallback EV: {total_ev / n_batches:.4f}")
+        logger.info(f"Fallback CE: {total_ce / n_batches:.4f}")
 
     # Save results
     results = {
@@ -207,7 +251,22 @@ def train_baseline_hsae(model, activations, config, exp_dir):
     )
 
     if trainer.use_wandb:
-        wandb.log({"final_metrics": final_metrics})
+        # Log comprehensive final metrics to W&B
+        wandb_metrics = {}
+        for key, value in final_metrics.items():
+            if isinstance(value, (int, float)) and not np.isnan(value):
+                wandb_metrics[f"final/{key}"] = value
+        
+        # Also log the key summary metrics
+        ev = 1.0 - final_metrics.get("1-EV", 1.0)
+        wandb_metrics.update({
+            "final/explained_variance": ev,
+            "final/cross_entropy_proxy": final_metrics.get("1-CE", 0.0),
+            "final/success": 1.0 if ev > 0.5 else 0.0,  # Success flag
+        })
+        
+        wandb.log(wandb_metrics)
+        logger.info(f"📊 Logged {len(wandb_metrics)} final metrics to W&B")
         wandb.finish()
 
     logger.info(f"Baseline training completed. Results saved to {exp_dir}")
