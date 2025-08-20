@@ -30,6 +30,7 @@ from polytope_hsae.estimators import (ConceptVectorEstimator, LDAEstimator,
 # Project imports
 from polytope_hsae.geometry import (CausalGeometry, compute_polytope_angles,
                                     intervention_test)
+from polytope_hsae.robust_download import robust_model_setup, ConnectionMonitor
 from polytope_hsae.validation import GeometryValidator
 
 logging.basicConfig(level=logging.INFO)
