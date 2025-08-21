@@ -220,6 +220,12 @@ def extract_teacher_vectors(config, hierarchies, activations, exp_dir):
             parent_id: {"down": down.tolist(), "up": up.tolist()}
             for parent_id, (down, up) in projectors.items()
         },
+        "config": {
+            "m_top": len(parent_vectors),
+            "m_low": max(len(deltas) for deltas in child_deltas.values()) if child_deltas else 0,
+            "subspace_dim": config["hsae"]["subspace_dim"],
+            "model_dim": parent_vectors[list(parent_vectors.keys())[0]].shape[0] if parent_vectors else 0,
+        },
     }
 
     with open(exp_dir / "teacher_vectors.json", "w") as f:

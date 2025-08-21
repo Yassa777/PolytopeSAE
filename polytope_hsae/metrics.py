@@ -36,6 +36,60 @@ def compute_explained_variance(x: torch.Tensor, x_hat: torch.Tensor) -> float:
     return ev.item()
 
 
+def compute_dual_explained_variance(
+    x: torch.Tensor, 
+    x_hat: torch.Tensor, 
+    geometry=None,
+    print_components: bool = False
+) -> Dict[str, float]:
+    """
+    Compute both standard EV and geometry-aware EV (Mahalanobis).
+    
+    Args:
+        x: Original activations [batch_size, dim] 
+        x_hat: Reconstructed activations [batch_size, dim]
+        geometry: CausalGeometry object (if None, only computes standard EV)
+        print_components: Whether to print detailed breakdown
+        
+    Returns:
+        Dictionary with 'standard_ev' and 'causal_ev' (if geometry provided)
+    """
+    results = {}
+    
+    # 1. STANDARD EV (PRIMARY) - apples-to-apples with flat SAEs
+    x_mean = torch.mean(x, dim=0, keepdim=True)
+    mse_standard = torch.sum((x - x_hat) ** 2)
+    var_standard = torch.sum((x - x_mean) ** 2)
+    ev_standard = 1.0 - (mse_standard / (var_standard + 1e-8))
+    results['standard_ev'] = ev_standard.item()
+    
+    if print_components:
+        logger.info(f"📊 STANDARD EV (Primary - comparable to flat SAEs):")
+        logger.info(f"  MSE: {mse_standard.item():.6f}")
+        logger.info(f"  Var: {var_standard.item():.6f}")
+        logger.info(f"  EV:  {ev_standard.item():.6f}")
+    
+    # 2. GEOMETRY-AWARE EV (SECONDARY) - Mahalanobis metric
+    if geometry is not None:
+        # Whiten both x and x_hat, then compute EV in causal space
+        x_whitened = geometry.whiten(x)
+        x_hat_whitened = geometry.whiten(x_hat)
+        x_mean_whitened = torch.mean(x_whitened, dim=0, keepdim=True)
+        
+        mse_causal = torch.sum((x_whitened - x_hat_whitened) ** 2)
+        var_causal = torch.sum((x_whitened - x_mean_whitened) ** 2)
+        ev_causal = 1.0 - (mse_causal / (var_causal + 1e-8))
+        results['causal_ev'] = ev_causal.item()
+        
+        if print_components:
+            logger.info(f"📊 CAUSAL EV (Secondary - Mahalanobis metric):")
+            logger.info(f"  MSE (causal): {mse_causal.item():.6f}")
+            logger.info(f"  Var (causal): {var_causal.item():.6f}")
+            logger.info(f"  EV (causal):  {ev_causal.item():.6f}")
+    
+    return results
+
+
 def compute_cross_entropy_proxy(
     x: torch.Tensor, x_hat: torch.Tensor, temperature: float = 1.0
 ) -> float:

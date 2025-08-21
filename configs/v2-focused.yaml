@@ -21,8 +21,8 @@ data:
 
 concepts:
   ontology: wordnet
-  parents: 80                    # Reduced from 200 to 80
-  max_children_per_parent: 4     # Capped at 4 most salient
+  parents: 5                     # Match Phase 1 actual extraction (dry run scale)
+  max_children_per_parent: 2     # Match what we actually extracted  
   prompts_per_concept: 64        # Reduced from 128 to 64
   split: {train: 0.70, val: 0.15, test: 0.15}
 
@@ -41,19 +41,19 @@ teacher:
   normalize_causal: true
 
 hsae:
-  # Reduced architecture for compute efficiency
-  m_top: 256                 # Reduced from 512
-  topk_parent: 8
-  subspace_dim: 96
-  m_low: 32                  # Reduced from 64
-  topk_child: 1
+  # IDENTICAL architecture for Phase 2 & 3 comparison (following geometric story K=1)
+  m_top: 32                  # Enough parent choices for variety across tokens
+  topk_parent: 1             # K=1 aligns with geometry & ablations
+  subspace_dim: 64           # 65 active dims/token (1 parent + 1*64 child dims)
+  m_low: 8                   # Enough child choices per parent
+  topk_child: 1              # K=1 for geometric consistency
   projectors_init: "svd_from_teacher"
-  l1_parent: 1.0e-3
-  l1_child: 1.0e-3
-  biorth_lambda: 5.0e-4      # Down-weighted
+  l1_parent: 2.0e-4          # Reduced, will add warmup
+  l1_child: 2.0e-4           # Reduced, will add warmup  
+  biorth_lambda: 1.0e-4      # Keep low until EV fits
   causal_ortho_lambda: 2.0e-4  # Applied only during freeze stage
-  router_temp: {start: 1.5, end: 0.7}
-  top_level_beta: 0.1        # Top-level reconstruction weight
+  router_temp: {start: 3.0, end: 0.7}  # Softer start to avoid dead routes
+  top_level_beta: 0.3        # Emphasize reconstruction
   
   # Our default settings (teacher-init friendly)
   use_tied_decoders_parent: false
@@ -64,27 +64,30 @@ hsae:
 
 training:
   optimizer: adamw
-  lr: 3.0e-4
+  lr: 2.5e-4                 # Stable learning rate
   weight_decay: 1.0e-4
   grad_clip: 1.0
-  batch_size_acts: 8192
+  batch_size_acts: 6144      # Better gradient estimates
+  lr_schedule: "cosine"      # Add cosine annealing
+  lr_warmup_steps: 1000      # Longer warmup for stability
+  l1_warmup_steps: 2000      # Warmup L1 from 0 → target over 2k steps
   
   # Baseline H-SAE training
   baseline:
-    total_steps: 7000
+    total_steps: 12000       # 7000 → 12000 steps (more training)
     init_method: "random"
   
   # Teacher-initialized H-SAE training  
   teacher_init:
-    total_steps: 10000
+    total_steps: 15000       # 10000 → 15000 (proportional increase)
     stage_A:
       freeze_decoder: true
-      steps: 1500
+      steps: 2000            # 1500 → 2000 (proportional)
       lr_mult: 0.5
       enable_causal_ortho: true
     stage_B:
       freeze_decoder: false
-      steps: 8500
+      steps: 13000           # 8500 → 13000 (proportional)
       lr_mult: 1.0
       enable_causal_ortho: false
       decoder_lr_mult: 0.5  # Lower LR for decoder adaptation

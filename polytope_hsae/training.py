@@ -28,6 +28,11 @@ from .models import HierarchicalSAE, HSAEConfig
 logger = logging.getLogger(__name__)
 
 
+class TrainingRestartException(Exception):
+    """Exception raised when training needs to restart due to sanity check fixes."""
+    pass
+
+
 class HSAETrainer:
     """Trainer for Hierarchical SAE with support for teacher initialization."""
 
@@ -125,6 +130,7 @@ class HSAETrainer:
         self.step += 1
 
         with torch.no_grad():
+            # Always use standard EV as primary metric (comparable to flat SAEs)
             ev = compute_explained_variance(batch, x_hat)
             ce_proxy = compute_cross_entropy_proxy(batch, x_hat)
 
@@ -146,6 +152,7 @@ class HSAETrainer:
             "active_parents_per_sample": metrics["active_parents_per_sample"].item(),
             "active_children_per_sample": metrics["active_children_per_sample"].item(),
             "router_temperature": metrics["router_temperature"],
+            "l1_multiplier": self._get_l1_multiplier(self.step),
             "lr": self.optimizer.param_groups[0]["lr"],
         }
 
@@ -153,6 +160,13 @@ class HSAETrainer:
         if self.config.get("data", {}).get("unit_norm", False):
             batch = F.normalize(batch, dim=-1)
         return batch
+
+    def _get_l1_multiplier(self, step: int) -> float:
+        """Get L1 warmup multiplier: ramp from 0 → 1 over l1_warmup_steps."""
+        l1_warmup_steps = self.config["training"].get("l1_warmup_steps", 0)
+        if l1_warmup_steps <= 0:
+            return 1.0
+        return min(1.0, step / l1_warmup_steps)
 
     def _compute_total_loss(
         self,
@@ -164,7 +178,11 @@ class HSAETrainer:
         torch.Tensor, torch.Tensor, torch.Tensor, float, torch.Tensor, torch.Tensor
     ]:
         recon_loss = metrics["reconstruction_loss"]
-        l1_loss = metrics["l1_parent"] + metrics["l1_child"]
+        
+        # Apply L1 warmup
+        l1_multiplier = self._get_l1_multiplier(self.step)
+        l1_loss = l1_multiplier * (metrics["l1_parent"] + metrics["l1_child"])
+        
         top_level_loss = 0.0
         if (
             hasattr(self.model.config, "top_level_beta")
@@ -217,6 +235,7 @@ class HSAETrainer:
         history: Dict[str, List[float]],
         start_step: int = 0,
         desc: Optional[str] = None,
+        sanity_checker=None,
     ):
         pbar = tqdm(range(steps), desc=desc or stage)
         for step in pbar:
@@ -236,10 +255,19 @@ class HSAETrainer:
                 {
                     "Loss": f"{metrics['total_loss']:.4f}",
                     "1-EV": f"{metrics['1-EV']:.4f}",
+                    "L1": f"{metrics.get('l1_multiplier', 1.0):.2f}",
                 }
             )
 
             global_step = start_step + step
+            
+            # Run sanity checks if enabled
+            if sanity_checker and val_loader:
+                current_ev = 1.0 - metrics['1-EV']
+                should_restart = sanity_checker.check_and_fix(global_step, val_loader, current_ev)
+                if should_restart:
+                    logger.info("🔄 Sanity checker requested training restart")
+                    raise TrainingRestartException("Sanity checker applied fixes - restart needed")
             if step % self.config["logging"]["log_every"] == 0:
                 history["train_loss"].append(metrics["total_loss"])
                 history["step"].append(global_step)
@@ -269,7 +297,7 @@ class HSAETrainer:
         return train_iter
 
     def train_baseline(
-        self, train_loader, val_loader=None, total_steps: int = 7000
+        self, train_loader, val_loader=None, total_steps: int = 7000, sanity_checker=None
     ) -> Dict[str, List[float]]:
         """
         Train baseline H-SAE (single stage, random initialization).
@@ -286,16 +314,22 @@ class HSAETrainer:
 
         history = {"train_loss": [], "val_loss": [], "step": []}
         train_iter = iter(train_loader)
-        self._run_stage(
-            train_iter,
-            train_loader,
-            val_loader,
-            total_steps,
-            stage="main",
-            history=history,
-            start_step=0,
-            desc="Baseline Training",
-        )
+        try:
+            self._run_stage(
+                train_iter,
+                train_loader,
+                val_loader,
+                total_steps,
+                stage="main",
+                history=history,
+                start_step=0,
+                desc="Baseline Training",
+                sanity_checker=sanity_checker,
+            )
+        except TrainingRestartException as e:
+            logger.info(f"Training interrupted for restart: {e}")
+            # Return partial history - caller will handle restart
+            return history
         logger.info("Baseline training completed")
         return history
 
@@ -305,6 +339,7 @@ class HSAETrainer:
         val_loader=None,
         stabilize_steps: int = 1500,
         adapt_steps: int = 8500,
+        sanity_checker=None,
     ) -> Dict[str, List[float]]:
         """
         Train teacher-initialized H-SAE with two-stage schedule.
@@ -326,37 +361,44 @@ class HSAETrainer:
         history = {"train_loss": [], "val_loss": [], "step": [], "stage": []}
         train_iter = iter(train_loader)
 
-        logger.info("Stage A: Stabilizing with frozen decoder")
-        self._freeze_decoder_weights()
-        train_iter = self._run_stage(
-            train_iter,
-            train_loader,
-            val_loader,
-            stabilize_steps,
-            stage="stabilize",
-            history=history,
-            start_step=0,
-            desc="Stage A: Stabilize",
-        )
+        try:
+            logger.info("Stage A: Stabilizing with frozen decoder")
+            self._freeze_decoder_weights()
+            train_iter = self._run_stage(
+                train_iter,
+                train_loader,
+                val_loader,
+                stabilize_steps,
+                stage="stabilize",
+                history=history,
+                start_step=0,
+                desc="Stage A: Stabilize",
+                sanity_checker=sanity_checker,
+            )
 
-        logger.info("Stage B: Adapting with unfrozen decoder")
-        self._unfreeze_decoder_weights()
-        decoder_lr_mult = (
-            self.config["training"].get("teacher_init", {}).get("decoder_lr_mult", 1.0)
-        )
-        if decoder_lr_mult != 1.0:
-            self._set_decoder_lr(self.config["training"]["lr"] * decoder_lr_mult)
+            logger.info("Stage B: Adapting with unfrozen decoder")
+            self._unfreeze_decoder_weights()
+            decoder_lr_mult = (
+                self.config["training"].get("teacher_init", {}).get("decoder_lr_mult", 1.0)
+            )
+            if decoder_lr_mult != 1.0:
+                self._set_decoder_lr(self.config["training"]["lr"] * decoder_lr_mult)
 
-        self._run_stage(
-            train_iter,
-            train_loader,
-            val_loader,
-            adapt_steps,
-            stage="adapt",
-            history=history,
-            start_step=stabilize_steps,
-            desc="Stage B: Adapt",
-        )
+            self._run_stage(
+                train_iter,
+                train_loader,
+                val_loader,
+                adapt_steps,
+                stage="adapt",
+                history=history,
+                start_step=stabilize_steps,
+                desc="Stage B: Adapt",
+                sanity_checker=sanity_checker,
+            )
+        except TrainingRestartException as e:
+            logger.info(f"Training interrupted for restart: {e}")
+            # Return partial history - caller will handle restart
+            return history
 
         logger.info("Teacher-initialized training completed")
         return history
@@ -384,6 +426,7 @@ class HSAETrainer:
                 biorth_loss = metrics.get("biorth_penalty", 0.0)
                 total_loss = recon_loss + l1_loss + biorth_loss
 
+                # Always use standard EV as primary metric (comparable to flat SAEs)
                 ev = compute_explained_variance(batch, x_hat)
                 ce_proxy = compute_cross_entropy_proxy(batch, x_hat)
 

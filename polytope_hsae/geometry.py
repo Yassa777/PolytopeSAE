@@ -93,6 +93,13 @@ class CausalGeometry:
         )
         return x @ W.T
 
+    def unwhiten(self, x_whitened: torch.Tensor) -> torch.Tensor:
+        """Apply inverse whitening transformation: x = x̃W^{-1} = x̃W^T."""
+        W = self.W.to(
+            x_whitened.device, dtype=x_whitened.dtype if x_whitened.dtype.is_floating_point else torch.float32
+        )
+        return x_whitened @ W
+
     def causal_inner_product(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
         Compute causal inner product: ⟨x,y⟩_c = x^T Σ^{-1} y = (Wx)^T (Wy).
@@ -139,6 +146,39 @@ class CausalGeometry:
         self.W = self.W.to(device)
         self.Sigma = self.Sigma.to(device)
         return self
+
+    def test_linear_identity(self, x: torch.Tensor, tolerance: float = 1e-4) -> Dict[str, float]:
+        """
+        Test linear identity: x → whiten → unwhiten → should equal x.
+        
+        Args:
+            x: Test tensor [batch_size, dim]
+            tolerance: Numerical tolerance for identity check
+            
+        Returns:
+            Dictionary with identity test metrics
+        """
+        x_whitened = self.whiten(x)
+        x_reconstructed = self.unwhiten(x_whitened)
+        
+        # Compute reconstruction error
+        mse = torch.mean((x - x_reconstructed) ** 2).item()
+        max_error = torch.max(torch.abs(x - x_reconstructed)).item()
+        
+        # Compute explained variance (should be ~1.0)
+        from polytope_hsae.metrics import compute_explained_variance
+        identity_ev = compute_explained_variance(x, x_reconstructed)
+        
+        # Check if identity holds within tolerance
+        identity_ok = max_error < tolerance
+        
+        return {
+            "identity_mse": mse,
+            "identity_max_error": max_error,
+            "identity_ev": identity_ev,
+            "identity_ok": identity_ok,
+            "tolerance": tolerance
+        }
 
     def project_causal(self, x: torch.Tensor, onto: torch.Tensor) -> torch.Tensor:
         """
