@@ -40,18 +40,23 @@ class LDAEstimator:
         self.class_balance = class_balance
 
     def estimate_binary_direction(
-        self, X_pos: torch.Tensor, X_neg: torch.Tensor, geometry
+        self,
+        X_pos: torch.Tensor,
+        X_neg: torch.Tensor,
+        geometry,
+        normalize: bool = True,
     ) -> torch.Tensor:
-        """
-        Estimate LDA direction for binary classification in causal space.
+        """Estimate LDA direction for binary classification in causal space.
 
         Args:
-            X_pos: Positive examples [N_pos, d]
-            X_neg: Negative examples [N_neg, d]
+            X_pos: Positive examples ``[N_pos, d]``
+            X_neg: Negative examples ``[N_neg, d]``
             geometry: CausalGeometry instance for whitening
+            normalize: Whether to normalize under the causal norm before
+                returning.
 
         Returns:
-            LDA direction vector normalized under causal norm
+            LDA direction vector. Normalized if ``normalize`` is ``True``.
         """
         # Whiten the data
         X_pos_whitened = geometry.whiten(X_pos)
@@ -99,7 +104,9 @@ class LDAEstimator:
         direction = direction.to(torch.float32)
 
         direction_original = direction @ geometry.W.T
-        return geometry.normalize_causal(direction_original)
+        if normalize:
+            return geometry.normalize_causal(direction_original)
+        return direction_original
 
     def estimate_multiclass_directions(
         self,
@@ -175,6 +182,8 @@ class ConceptVectorEstimator:
         """
         self.lda_estimator = lda_estimator or LDAEstimator()
         self.geometry = geometry
+        # Store raw, unnormalized parent vectors for delta computation
+        self.parent_raw_vectors: Dict[str, torch.Tensor] = {}
 
     def estimate_parent_vectors(
         self, parent_activations: Dict[str, Dict[str, torch.Tensor]]
@@ -196,10 +205,13 @@ class ConceptVectorEstimator:
             X_pos = data["pos"]  # Activations where parent concept is present
             X_neg = data["neg"]  # Activations where parent concept is absent
 
-            parent_vector = self.lda_estimator.estimate_binary_direction(
-                X_pos, X_neg, self.geometry
+            # Get raw parent vector first, then normalize for return
+            parent_vector_raw = self.lda_estimator.estimate_binary_direction(
+                X_pos, X_neg, self.geometry, normalize=False
             )
+            parent_vector = self.geometry.normalize_causal(parent_vector_raw)
             parent_vectors[parent_id] = parent_vector
+            self.parent_raw_vectors[parent_id] = parent_vector_raw
 
         return parent_vectors
 
@@ -224,8 +236,13 @@ class ConceptVectorEstimator:
             if parent_id not in parent_vectors:
                 logger.warning(f"No parent vector for {parent_id}, skipping children")
                 continue
-
-            parent_vector = parent_vectors[parent_id]
+            parent_vector_raw = self.parent_raw_vectors.get(parent_id)
+            if parent_vector_raw is None:
+                logger.warning(
+                    f"Raw parent vector for {parent_id} not found; using normalized vector"
+                )
+                parent_vector_raw = parent_vectors[parent_id]
+            
             child_deltas[parent_id] = {}
 
             for child_id, data in children_data.items():
@@ -234,13 +251,13 @@ class ConceptVectorEstimator:
                 X_pos = data["pos"]  # Activations where child concept is present
                 X_neg = data["neg"]  # Activations where child concept is absent
 
-                # Estimate child vector
-                child_vector = self.lda_estimator.estimate_binary_direction(
-                    X_pos, X_neg, self.geometry
+                # Estimate child vector in raw space
+                child_vector_raw = self.lda_estimator.estimate_binary_direction(
+                    X_pos, X_neg, self.geometry, normalize=False
                 )
 
-                # Compute delta: δ_{c|p} = ℓ_c - ℓ_p
-                delta_vector = child_vector - parent_vector
+                # Compute delta using raw vectors: δ_{c|p} = ℓ_c - ℓ_p
+                delta_vector = child_vector_raw - parent_vector_raw
                 child_deltas[parent_id][child_id] = delta_vector
 
         return child_deltas

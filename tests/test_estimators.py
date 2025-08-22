@@ -3,8 +3,12 @@ import sys
 
 import torch
 
-from polytope_hsae.estimators import (LDAEstimator, OrthogonalityStats,
-                                      validate_orthogonality)
+from polytope_hsae.estimators import (
+    LDAEstimator,
+    OrthogonalityStats,
+    validate_orthogonality,
+    ConceptVectorEstimator,
+)
 from polytope_hsae.geometry import CausalGeometry
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
@@ -42,3 +46,35 @@ def test_validate_orthogonality_detects_orthogonal_and_nonorthogonal():
     stats_non = validate_orthogonality(parent_vectors, child_non, geom)
     assert stats_non.fraction_orthogonal_80deg == 0.0
     assert stats_non.mean_inner_product > 0.1
+
+
+def test_child_delta_uses_raw_vectors():
+    """Child deltas should be computed from unnormalized vectors."""
+
+    class DummyLDA:
+        def estimate_binary_direction(self, X_pos, X_neg, geometry, normalize=True):
+            # Return a known raw vector depending on inputs
+            if torch.allclose(X_pos, torch.tensor([[1.0, 0.0]])):
+                vec = torch.tensor([2.0, 0.0])  # parent vector (length 2)
+            else:
+                vec = torch.tensor([0.0, 3.0])  # child vector (length 3)
+            if normalize:
+                return geometry.normalize_causal(vec)
+            return vec
+
+    geom = CausalGeometry(torch.eye(2))
+    estimator = ConceptVectorEstimator(lda_estimator=DummyLDA(), geometry=geom)
+
+    parent_activations = {
+        "p": {"pos": torch.tensor([[1.0, 0.0]]), "neg": torch.zeros(1, 2)}
+    }
+    child_activations = {
+        "p": {"c": {"pos": torch.tensor([[0.0, 1.0]]), "neg": torch.zeros(1, 2)}}
+    }
+
+    parent_vectors = estimator.estimate_parent_vectors(parent_activations)
+    child_deltas = estimator.estimate_child_deltas(parent_vectors, child_activations)
+    delta = child_deltas["p"]["c"]
+
+    expected = torch.tensor([0.0, 3.0]) - torch.tensor([2.0, 0.0])
+    assert torch.allclose(delta, expected)
