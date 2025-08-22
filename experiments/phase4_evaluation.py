@@ -849,6 +849,15 @@ def main():
     # Set up experiment
     exp_dir = setup_experiment(config)
 
+    # Initialize W&B
+    wandb.init(
+        project=config.get("wandb_project", "polytope-hsae"),
+        name=f"phase4_evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        config=config,
+        tags=["phase4", "evaluation", "steering", "ablations"],
+        notes=f"Evaluation and steering experiments: {config.get('run', {}).get('notes', 'Phase 4 evaluation')}",
+    )
+
     # Load models and data
     models, parent_vectors, child_deltas, hierarchies = load_models_and_data(config)
 
@@ -858,6 +867,28 @@ def main():
 
     # Run ablation studies
     ablation_results = run_ablation_studies(models, config, exp_dir)
+    
+    # Log ablation results to W&B
+    if ablation_results:
+        ablation_metrics = {}
+        for model_name, metrics in ablation_results.items():
+            if model_name != "teacher_vs_baseline" and isinstance(metrics, dict):
+                # Log individual model metrics
+                for metric_name, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        ablation_metrics[f"ablation/{model_name}/{metric_name}"] = value
+                        
+        # Log teacher vs baseline comparison if available
+        if "teacher_vs_baseline" in ablation_results:
+            comparison = ablation_results["teacher_vs_baseline"]
+            if isinstance(comparison, dict):
+                for comp_name, comp_data in comparison.items():
+                    if isinstance(comp_data, dict) and "percent_improvement" in comp_data:
+                        ablation_metrics[f"comparison/{comp_name}/improvement_pct"] = comp_data["percent_improvement"]
+                    elif isinstance(comp_data, (int, float)):
+                        ablation_metrics[f"comparison/{comp_name}"] = comp_data
+                        
+        wandb.log(ablation_metrics)
 
     # Run steering experiments
     steering_results = {}
@@ -865,6 +896,17 @@ def main():
         steering_results = run_steering_experiments(
             models, parent_vectors, child_deltas, hierarchies, config, exp_dir
         )
+        
+        # Log steering results to W&B
+        if steering_results:
+            steering_metrics = {}
+            for model_name, results in steering_results.items():
+                if isinstance(results, dict):
+                    analysis = results.get("analysis", {})
+                    for metric_name, value in analysis.items():
+                        if isinstance(value, (int, float)):
+                            steering_metrics[f"steering/{model_name}/{metric_name}"] = value
+            wandb.log(steering_metrics)
 
     # Run geometry comparison
     geometry_comparison = {}
@@ -872,6 +914,18 @@ def main():
         geometry_comparison = run_euclidean_vs_causal_ablation(
             parent_vectors, child_deltas, config, exp_dir
         )
+        
+        # Log geometry comparison to W&B
+        if geometry_comparison:
+            geometry_metrics = {}
+            for geom_name, geom_data in geometry_comparison.items():
+                if isinstance(geom_data, (int, float)):
+                    geometry_metrics[f"geometry/{geom_name}"] = geom_data
+                elif isinstance(geom_data, dict):
+                    for sub_name, sub_value in geom_data.items():
+                        if isinstance(sub_value, (int, float)):
+                            geometry_metrics[f"geometry/{geom_name}/{sub_name}"] = sub_value
+            wandb.log(geometry_metrics)
 
     # Generate final report
     report = generate_final_report(
@@ -887,6 +941,44 @@ def main():
             .get("overall_success", False)
         )
 
+    # Log final summary metrics to W&B
+    final_metrics = {
+        "final/overall_success": success,
+        "final/phase_completed": True,
+    }
+    
+    # Extract key summary metrics if available
+    if report and isinstance(report, dict):
+        # Log summary from final report
+        summary = report.get("summary", {})
+        
+        if "teacher_vs_baseline" in summary:
+            tvsb = summary["teacher_vs_baseline"]
+            final_metrics.update({
+                "final/purity_improvement_pct": tvsb.get("purity_improvement", 0),
+                "final/leakage_reduction_pct": tvsb.get("leakage_reduction", 0),
+                "final/reconstruction_maintained": tvsb.get("reconstruction_maintained", False),
+                "final/teacher_vs_baseline_success": tvsb.get("overall_success", False),
+            })
+            
+        if "steering" in summary:
+            steer = summary["steering"]
+            final_metrics.update({
+                "final/mean_steering_effect": steer.get("mean_effect", 0),
+                "final/steering_models_tested": steer.get("models_tested", 0),
+            })
+            
+        if "geometry" in summary:
+            geom = summary["geometry"]
+            final_metrics.update({
+                "final/causal_vs_euclidean_improvement": geom.get("causal_vs_euclidean_improvement", 0),
+                "final/causal_orthogonality_rate": geom.get("causal_orthogonality_rate", 0),
+                "final/ratio_invariance_median_kl": geom.get("ratio_invariance_median_kl", 0),
+                "final/ratio_invariance_fraction_below_0_1": geom.get("ratio_invariance_fraction_below_0_1", 0),
+            })
+    
+    wandb.log(final_metrics)
+
     logger.info("Phase 4 completed!")
     logger.info(f"Results saved to: {exp_dir}")
 
@@ -894,6 +986,9 @@ def main():
         logger.info("✅ Phase 4 SUCCESSFUL - all targets met!")
     else:
         logger.warning("⚠️  Phase 4 shows mixed results - check detailed analysis")
+
+    # Finish W&B run
+    wandb.finish()
 
     return success
 

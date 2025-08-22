@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import wandb
 import yaml
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -604,6 +605,15 @@ def main():
     # Set up experiment
     exp_dir = setup_experiment(config)
 
+    # Initialize W&B
+    wandb.init(
+        project=config.get("wandb_project", "polytope-hsae"),
+        name=f"phase1_teacher_extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        config=config,
+        tags=["phase1", "teacher-extraction", "geometric-validation"],
+        notes=f"Teacher vector extraction and geometric validation: {config.get('run', {}).get('notes', 'Phase 1 extraction')}",
+    )
+
     # Load or create concepts
     hierarchies = load_or_create_concepts(config, exp_dir)
 
@@ -631,6 +641,16 @@ def main():
         config, hierarchies, activations, exp_dir, unembedding_matrix
     )
 
+    # Log teacher extraction results to W&B
+    teacher_stats = {
+        "teacher/n_parents": len(parent_vectors),
+        "teacher/n_children_total": sum(len(deltas) for deltas in child_deltas.values()),
+        "teacher/avg_children_per_parent": sum(len(deltas) for deltas in child_deltas.values()) / len(parent_vectors) if parent_vectors else 0,
+        "teacher/model_dim": parent_vectors[list(parent_vectors.keys())[0]].shape[0] if parent_vectors else 0,
+        "teacher/subspace_dim": config["hsae"]["subspace_dim"],
+    }
+    wandb.log(teacher_stats)
+
     # Validate geometry
     validation_results = validate_geometry(
         config,
@@ -645,6 +665,43 @@ def main():
         activations,
         hierarchies,
     )
+
+    # Log comprehensive validation results to W&B
+    validation_metrics = {
+        # Orthogonality test results
+        "validation/median_angle_deg": validation_results["orthogonality_test"]["median_angle_deg"],
+        "validation/fraction_above_80deg": validation_results["orthogonality_test"]["fraction_above_80deg"],
+        "validation/fraction_above_85deg": validation_results["orthogonality_test"]["fraction_above_85deg"],
+        "validation/passes_orthogonality_threshold": validation_results["orthogonality_test"]["passes_threshold"],
+        
+        # Angle statistics
+        "validation/mean_angle_deg": validation_results["angle_statistics"]["mean_angle_deg"],
+        "validation/q25_angle_deg": validation_results["angle_statistics"]["q25_angle_deg"],
+        "validation/q75_angle_deg": validation_results["angle_statistics"]["q75_angle_deg"],
+        
+        # Metric triangulation
+        "validation/triangulation_passes": validation_results["metric_triangulation"]["triangulation_passes"],
+        "validation/passing_geometries": validation_results["metric_triangulation"]["passing_geometries"],
+        "validation/total_geometries": validation_results["metric_triangulation"]["total_geometries"],
+        
+        # Overall validation
+        "validation/passes_validation": validation_results["passes_validation"],
+    }
+    
+    # Log individual geometry results if available
+    for geometry_name, results in validation_results["metric_triangulation"]["results_per_geometry"].items():
+        validation_metrics[f"triangulation/{geometry_name}/median_angle_deg"] = results["median_angle_deg"]
+        validation_metrics[f"triangulation/{geometry_name}/fraction_above_80deg"] = results["fraction_above_80deg"]
+        validation_metrics[f"triangulation/{geometry_name}/passes_threshold"] = results["passes_threshold"]
+    
+    # Log control experiment results if available
+    if "control_experiments" in validation_results and "summary" in validation_results["control_experiments"]:
+        controls = validation_results["control_experiments"]["summary"]["controls"]
+        for control_name, control_data in controls.items():
+            validation_metrics[f"control/{control_name}/median_angle"] = control_data["median_angle"]
+            validation_metrics[f"control/{control_name}/effect_size"] = control_data["effect_size_vs_original"]
+    
+    wandb.log(validation_metrics)
 
     # Final report
     logger.info("Phase 1 completed!")
@@ -662,6 +719,9 @@ def main():
     if tokenizer is not None:
         del tokenizer
     torch.cuda.empty_cache()
+
+    # Finish W&B run
+    wandb.finish()
 
     return validation_results["passes_validation"]
 
