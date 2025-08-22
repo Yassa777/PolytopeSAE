@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import contextlib
 import h5py
 import numpy as np
 import torch
@@ -164,73 +165,38 @@ class ActivationCapture:
         
         raise RuntimeError("Could not retrieve final residual/hidden state")
 
-    def capture_batch_activations(self, prompts: List[str]) -> torch.Tensor:
-        """
-        Capture activations for a batch of prompts using robust final residual extraction.
-
-        Args:
-            prompts: List of text prompts
-
-        Returns:
-            Tensor of activations [batch_size, seq_len, hidden_dim] (float32, CPU)
-        """
-        # Tokenize prompts
+    def capture_batch_activations(self, prompts: List[str], *, to_cpu_float: bool = True) -> torch.Tensor:
+        """Return [B,T,d] activations.
+        If to_cpu_float=False, keep on device/dtype for downstream use."""
         inputs = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.config.max_length,
+            prompts, return_tensors="pt", padding=True, truncation=True, max_length=self.config.max_length
         ).to(self.device)
 
-        with torch.no_grad():
+        # Use inference_mode + autocast(bf16) for transformer blocks
+        with torch.inference_mode(), torch.autocast(device_type=self.device.type, dtype=self.config.dtype):
             outputs = self.model(**inputs, output_hidden_states=True)
-            
-        # Get final residual state using robust method
-        acts = self._get_final_residual(outputs)  # [B, T, d] on device
-        
-        # Cast to float32 for HDF5 compatibility and move to CPU
-        acts = acts.float().cpu()
-        return acts
+            acts = self._get_final_residual(outputs)  # [B,T,d] on device
+
+        if to_cpu_float:
+            return acts.float().cpu()
+        return acts  # keep bf16 on device
 
     def capture_last_token_activations(self, prompts: List[str]) -> torch.Tensor:
-        """
-        Capture activations for the last token of each prompt.
-
-        Args:
-            prompts: List of text prompts
-
-        Returns:
-            Tensor of last-token activations [batch_size, hidden_dim]
-        """
-        # Tokenize to get attention masks
+        """Return [B,d] last-token activations, CPU float32 for HDF5 compatibility."""
         inputs = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.config.max_length,
-        )
+            prompts, return_tensors="pt", padding=True, truncation=True, max_length=self.config.max_length
+        ).to(self.device)
 
-        # Get sequence lengths (last non-padding token)
-        attention_mask = inputs["attention_mask"]
-        seq_lengths = attention_mask.sum(dim=1) - 1  # -1 for 0-indexing
+        with torch.inference_mode(), torch.autocast(device_type=self.device.type, dtype=self.config.dtype):
+            outputs = self.model(**inputs, output_hidden_states=True)
+            acts = self._get_final_residual(outputs)  # [B,T,d], device/dtype
 
-        # Capture full activations
-        full_activations = self.capture_batch_activations(
-            prompts
-        )  # [batch, seq, hidden]
+        # Vectorized gather of last non-pad token
+        last_idx = inputs["attention_mask"].sum(dim=1) - 1        # [B]
+        gather_idx = last_idx.view(-1, 1, 1).expand(-1, 1, acts.size(-1))
+        last = acts.gather(dim=1, index=gather_idx).squeeze(1)    # [B,d]
 
-        # Extract last token activations
-        batch_size = full_activations.shape[0]
-        hidden_dim = full_activations.shape[2]
-        last_token_activations = torch.zeros(batch_size, hidden_dim)
-
-        for i in range(batch_size):
-            last_pos = seq_lengths[i].item()
-            last_token_activations[i] = full_activations[i, last_pos]
-
-        return last_token_activations
+        return last.float().cpu()
 
     def capture_concept_activations(
         self, concept_prompts: Dict[str, List[str]], save_path: Optional[str] = None
@@ -393,19 +359,22 @@ class ActivationCapture:
         activations: Dict[str, torch.Tensor],
         filepath: str,
         use_async: bool = False,
+        *,
+        chunks: Optional[Tuple[int, ...]] = None,
+        compression: str = "lzf",
     ) -> Optional[mp.Process]:
         """Save activations to HDF5 file.
 
         When ``use_async`` is True, the save operation is executed in a
-        separate process and the handle is returned.
-        """
+        separate process and the handle is returned."""
 
         def _save() -> None:
             Path(filepath).parent.mkdir(parents=True, exist_ok=True)
             with h5py.File(filepath, "w") as f:
                 for concept_id, activation_tensor in activations.items():
+                    arr = activation_tensor.to(torch.float32).cpu().numpy()
                     f.create_dataset(
-                        concept_id, data=activation_tensor.to(torch.float32).numpy()
+                        concept_id, data=arr, chunks=chunks, compression=compression
                     )
             logger.info(
                 f"Saved activations for {len(activations)} concepts to {filepath}"
@@ -423,6 +392,9 @@ class ActivationCapture:
         activations: Dict[str, Dict[str, torch.Tensor]],
         filepath: str,
         use_async: bool = False,
+        *,
+        chunks: Optional[Tuple[int, ...]] = None,
+        compression: str = "lzf",
     ) -> Optional[mp.Process]:
         """Save hierarchical activations to HDF5 file."""
 
@@ -432,8 +404,9 @@ class ActivationCapture:
                 for concept_id, pos_neg_dict in activations.items():
                     concept_group = f.create_group(concept_id)
                     for pos_neg, activation_tensor in pos_neg_dict.items():
+                        arr = activation_tensor.to(torch.float32).cpu().numpy()
                         concept_group.create_dataset(
-                            pos_neg, data=activation_tensor.to(torch.float32).numpy()
+                            pos_neg, data=arr, chunks=chunks, compression=compression
                         )
             logger.info(
                 f"Saved hierarchical activations for {len(activations)} concepts to {filepath}"

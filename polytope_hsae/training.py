@@ -6,12 +6,17 @@ temperature annealing, decoder normalization, and comprehensive logging.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+import contextlib
+import multiprocessing as mp
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import h5py
 import torch
 import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 from tqdm import tqdm
 
 try:
@@ -42,6 +47,7 @@ class HSAETrainer:
         config: Dict[str, Any],
         geometry=None,
         use_wandb: bool = True,
+        use_compile: bool = True,
     ):
         """
         Initialize H-SAE trainer.
@@ -52,16 +58,26 @@ class HSAETrainer:
             geometry: CausalGeometry instance for causal orthogonality
             use_wandb: Whether to use Weights & Biases logging
         """
-        self.model = model
         self.config = config
         self.geometry = geometry
         self.use_wandb = use_wandb and wandb is not None
+        device_str = config.get("run", {}).get("device", "cuda:0")
+        if device_str.startswith("cuda") and not torch.cuda.is_available():
+            device_str = "cpu"
+        self.device = torch.device(device_str)
+        self.model = model.to(self.device)
 
-        # Setup optimizer
+        # Fast math for Ampere/Blackwell
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        fused_ok = torch.cuda.is_available() and "fused" in AdamW.__init__.__code__.co_varnames
         self.optimizer = AdamW(
-            model.parameters(),
+            self.model.parameters(),
             lr=config["training"]["lr"],
             weight_decay=config["training"]["weight_decay"],
+            betas=config["training"].get("betas", (0.9, 0.95)),
+            fused=fused_ok,
         )
 
         # Setup scheduler if warmup is specified
@@ -89,72 +105,60 @@ class HSAETrainer:
         self.step = 0
         self.epoch = 0
         self.best_val_loss = float("inf")
+        self.grad_clip = self.config["training"].get("grad_clip")
+
+        if use_compile and hasattr(torch, "compile"):
+            self.model = torch.compile(self.model, mode="max-autotune")
 
         # Logging
         self.log_dir = Path(config["logging"]["save_dir"])
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
     def train_step(self, batch: torch.Tensor, stage: str = "main") -> Dict[str, float]:
-        """
-        Single training step.
-
-        Args:
-            batch: Input batch [batch_size, input_dim]
-            stage: Training stage ("stabilize", "adapt", or "main")
-
-        Returns:
-            Dictionary with loss components and metrics
-        """
+        """Single training step."""
         self.model.train()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
-        batch = self._normalize_batch(batch)
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        x = x.to(self.device, non_blocking=True)
+        x = self._normalize_batch(x)
 
-        x_hat, (parent_codes, child_codes), metrics = self.model(batch)
+        autocast_ctx = (
+            torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
+            if self.device.type == "cuda"
+            else contextlib.nullcontext()
+        )
+        with autocast_ctx:
+            x_hat, (_, _), metrics = self.model(x)
+            loss_dict = self._compute_total_loss(x, x_hat, metrics, stage)
 
-        (
-            total_loss,
-            recon_loss,
-            l1_loss,
-            top_level_loss,
-            biorth_loss,
-            causal_ortho_loss,
-        ) = self._compute_total_loss(batch, x_hat, metrics, stage)
-
-        self._optimizer_step(total_loss)
+        self._optimizer_step(loss_dict["total_loss"])
 
         total_steps = self.config["training"].get("total_steps", 10000)
-        self.model.update_router_temperature(self.step, total_steps)
-        self.model.normalize_decoder_weights()
+        if hasattr(self.model, "update_router_temperature"):
+            self.model.update_router_temperature(self.step, total_steps)
+        if hasattr(self.model, "normalize_decoder_weights"):
+            self.model.normalize_decoder_weights()
 
         self.step += 1
 
         with torch.no_grad():
-            # Always use standard EV as primary metric (comparable to flat SAEs)
-            ev = compute_explained_variance(batch, x_hat)
-            ce_proxy = compute_cross_entropy_proxy(batch, x_hat)
+            ev = compute_explained_variance(x, x_hat)
+            ce_proxy = compute_cross_entropy_proxy(x, x_hat)
 
-        return {
-            "total_loss": total_loss.item(),
-            "recon_loss": recon_loss.item(),
-            "l1_loss": l1_loss.item(),
-            "top_level_loss": top_level_loss,
-            "biorth_loss": biorth_loss
-            if isinstance(biorth_loss, float)
-            else biorth_loss.item(),
-            "causal_ortho_loss": causal_ortho_loss
-            if isinstance(causal_ortho_loss, float)
-            else causal_ortho_loss.item(),
+        log_metrics = {
+            **loss_dict,
             "1-EV": 1.0 - ev,
             "1-CE": ce_proxy,
-            "parent_sparsity": metrics["parent_sparsity"].item(),
-            "child_sparsity": metrics["child_sparsity"].item(),
-            "active_parents_per_sample": metrics["active_parents_per_sample"].item(),
-            "active_children_per_sample": metrics["active_children_per_sample"].item(),
+            "parent_sparsity": metrics["parent_sparsity"],
+            "child_sparsity": metrics["child_sparsity"],
+            "active_parents_per_sample": metrics["active_parents_per_sample"],
+            "active_children_per_sample": metrics["active_children_per_sample"],
             "router_temperature": metrics["router_temperature"],
             "l1_multiplier": self._get_l1_multiplier(self.step),
             "lr": self.optimizer.param_groups[0]["lr"],
         }
+        return {k: (v.item() if torch.is_tensor(v) else float(v)) for k, v in log_metrics.items()}
 
     def _normalize_batch(self, batch: torch.Tensor) -> torch.Tensor:
         if self.config.get("data", {}).get("unit_norm", False):
@@ -174,25 +178,22 @@ class HSAETrainer:
         x_hat: torch.Tensor,
         metrics: Dict[str, torch.Tensor],
         stage: str,
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, float, torch.Tensor, torch.Tensor
-    ]:
+    ) -> Dict[str, torch.Tensor]:
         recon_loss = metrics["reconstruction_loss"]
-        
-        # Apply L1 warmup
-        l1_multiplier = self._get_l1_multiplier(self.step)
-        l1_loss = l1_multiplier * (metrics["l1_parent"] + metrics["l1_child"])
-        
-        top_level_loss = 0.0
+
+        l1_mult = self._get_l1_multiplier(self.step)
+        l1_loss = l1_mult * (metrics["l1_parent"] + metrics["l1_child"])
+
+        top_level_loss = torch.zeros((), device=batch.device)
         if (
             hasattr(self.model.config, "top_level_beta")
             and self.model.config.top_level_beta > 0
         ):
-            top_level_loss = (
-                self.model.config.top_level_beta * metrics["top_level_recon_loss"]
-            )
-        biorth_loss = metrics.get("biorth_penalty", 0.0)
-        causal_ortho_loss = 0.0
+            top_level_loss = self.model.config.top_level_beta * metrics["top_level_recon_loss"]
+
+        biorth_loss = metrics.get("biorth_penalty", torch.zeros((), device=batch.device))
+
+        causal_ortho_loss = torch.zeros((), device=batch.device)
         if (
             stage == "stabilize"
             and hasattr(self.model.config, "causal_ortho_lambda")
@@ -203,24 +204,21 @@ class HSAETrainer:
             causal_ortho_loss = self.model.compute_causal_orthogonality_penalty(
                 self.geometry
             )
-        total_loss = (
-            recon_loss + l1_loss + top_level_loss + biorth_loss + causal_ortho_loss
-        )
-        return (
-            total_loss,
-            recon_loss,
-            l1_loss,
-            top_level_loss,
-            biorth_loss,
-            causal_ortho_loss,
-        )
+
+        total = recon_loss + l1_loss + top_level_loss + biorth_loss + causal_ortho_loss
+        return {
+            "total_loss": total,
+            "recon_loss": recon_loss,
+            "l1_loss": l1_loss,
+            "top_level_loss": top_level_loss,
+            "biorth_loss": biorth_loss,
+            "causal_ortho_loss": causal_ortho_loss,
+        }
 
     def _optimizer_step(self, total_loss: torch.Tensor):
         total_loss.backward()
-        if "grad_clip" in self.config["training"]:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.config["training"]["grad_clip"]
-            )
+        if self.grad_clip is not None:
+            clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optimizer.step()
         if self.scheduler is not None:
             self.scheduler.step()
@@ -535,15 +533,55 @@ class HSAETrainer:
         return checkpoint
 
 
+class H5ActivationDataset(Dataset):
+    def __init__(self, h5_path: str, groups: Optional[List[str]] = None, last_token_only: bool = False):
+        self.h5 = h5py.File(h5_path, "r")
+        self.keys = groups or list(self.h5.keys())
+        self.index: List[Tuple[str, str, int]] = []
+        for k in self.keys:
+            dset = self.h5[k]["pos"]
+            n = dset.shape[0]
+            self.index.extend([(k, "pos", i) for i in range(n)])
+        self.last_token_only = last_token_only
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        k, split, i = self.index[idx]
+        x = self.h5[k][split][i]
+        return torch.from_numpy(x)
+
+
 def create_data_loader(
-    activations: torch.Tensor, batch_size: int = 8192, shuffle: bool = True
-) -> torch.utils.data.DataLoader:
-    """Create data loader from activation tensor."""
-    dataset = torch.utils.data.TensorDataset(activations)
-    return torch.utils.data.DataLoader(
-        dataset,
+    activation_tensors: Union[List[torch.Tensor], torch.Tensor],
+    batch_size: int,
+    device: str,
+    shuffle: bool = True,
+    num_workers: Optional[int] = None,
+    pin_memory: Optional[bool] = None,
+) -> DataLoader:
+    X = (
+        activation_tensors
+        if isinstance(activation_tensors, torch.Tensor)
+        else torch.cat(activation_tensors, dim=0)
+    )
+    ds = TensorDataset(X)
+
+    is_cuda = str(device).startswith("cuda")
+    if num_workers is None:
+        num_workers = max(4, mp.cpu_count() // 2)
+    if pin_memory is None:
+        pin_memory = is_cuda
+
+    loader = DataLoader(
+        ds,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=0,  # Avoid multiprocessing issues
-        pin_memory=True if torch.cuda.is_available() else False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=4 if num_workers > 0 else None,
+        drop_last=True,
     )
+    return loader

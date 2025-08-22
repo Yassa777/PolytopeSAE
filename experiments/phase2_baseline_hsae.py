@@ -171,10 +171,14 @@ def _train_baseline_hsae_single_attempt(model, activations, config, exp_dir, att
     train_loader = create_data_loader(
         train_activations,
         batch_size=config["training"]["batch_size_acts"],
+        device=config["run"]["device"],
         shuffle=True,
     )
     val_loader = create_data_loader(
-        val_activations, batch_size=config["training"]["batch_size_acts"], shuffle=False
+        val_activations,
+        batch_size=config["training"]["batch_size_acts"],
+        device=config["run"]["device"],
+        shuffle=False,
     )
 
     # Initialize trainer
