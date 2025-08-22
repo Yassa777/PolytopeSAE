@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import yaml
 from tqdm import tqdm
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from polytope_hsae.activations import ActivationCapture, ActivationConfig
 from polytope_hsae.concepts import (ConceptCurator, ConceptSplitter,
@@ -30,7 +30,6 @@ from polytope_hsae.estimators import (ConceptVectorEstimator, LDAEstimator,
 # Project imports
 from polytope_hsae.geometry import (CausalGeometry, compute_polytope_angles,
                                     intervention_test)
-from polytope_hsae.robust_download import robust_model_setup, ConnectionMonitor
 from polytope_hsae.validation import GeometryValidator
 
 logging.basicConfig(level=logging.INFO)
@@ -143,27 +142,9 @@ def capture_activations(config, hierarchies, exp_dir):
     return activations
 
 
-def extract_teacher_vectors(config, hierarchies, activations, exp_dir):
+def extract_teacher_vectors(config, hierarchies, activations, exp_dir, unembedding_matrix):
     """Extract parent vectors and child deltas using LDA."""
     logger.info("Extracting teacher vectors")
-
-    # Use a model with an LM head so we can reliably find the unembedding & logits
-    model = AutoModelForCausalLM.from_pretrained(
-        config["model"]["name"],
-        low_cpu_mem_usage=True,
-        device_map={"": config["run"]["device"]},
-    )
-
-    # Prefer the model's lm_head when present
-    if hasattr(model, "lm_head") and isinstance(model.lm_head, torch.nn.Linear):
-        unembedding_matrix = model.lm_head.weight.data
-    else:
-        # fallback: tied weights or input embeddings
-        try:
-            unembedding_matrix = model.get_output_embeddings().weight.data
-        except Exception:
-            emb = model.get_input_embeddings().weight.data
-            unembedding_matrix = emb  # shape (V, d)
 
     logger.info(f"Unembedding matrix shape: {unembedding_matrix.shape}")
 
@@ -240,34 +221,35 @@ def extract_teacher_vectors(config, hierarchies, activations, exp_dir):
     return parent_vectors, child_deltas, projectors, geometry
 
 
-def validate_geometry(config, parent_vectors, child_deltas, geometry, exp_dir):
+def validate_geometry(
+    config,
+    parent_vectors,
+    child_deltas,
+    geometry,
+    exp_dir,
+    model,
+    tokenizer,
+    unembedding_matrix,
+):
     """Validate geometric claims with metric triangulation."""
     logger.info("Validating geometric claims with metric triangulation")
 
     # Create validator
     validator = GeometryValidator(geometry)
-    
+
     # Metric triangulation: test multiple geometry sources
     geometry_sources = ["from_unembedding"]  # Always include the main one
     triangulation_results = {}
-    
-    # Try alternative geometry sources if enabled
-    try:
-        # Load model for alternative geometries
-        model = AutoModelForCausalLM.from_pretrained(
-            config["model"]["name"],
-            low_cpu_mem_usage=True,
-            device_map={"": config["run"]["device"]},
-        )
-        tokenizer = AutoTokenizer.from_pretrained(config["model"]["name"])
-        
+
+    # Try alternative geometry sources if model and tokenizer are provided
+    if model is not None and tokenizer is not None:
         # Create dummy prompts for geometry validation
         test_prompts = [
             "The capital of France is Paris.",
             "Water boils at 100 degrees Celsius.",
             "The sun is a star in our solar system.",
             "Dogs are domestic animals.",
-            "Mathematics is the study of numbers."
+            "Mathematics is the study of numbers.",
         ]
         
         # Test from_logit_cov geometry
@@ -318,15 +300,8 @@ def validate_geometry(config, parent_vectors, child_deltas, geometry, exp_dir):
             
         except Exception as e:
             logger.warning(f"Could not test Fisher-like geometry: {e}")
-            
-        # Clean up
-        del model
-        if 'tokenizer' in locals():
-            del tokenizer
-            
-    except Exception as e:
-        logger.warning(f"Could not load model for alternative geometries: {e}")
-        logger.info("Continuing with standard unembedding geometry only")
+    else:
+        logger.warning("Model or tokenizer not provided; skipping alternative geometries")
 
     # Test hierarchical orthogonality
     orthogonality_results = validator.test_hierarchical_orthogonality(
@@ -359,29 +334,9 @@ def validate_geometry(config, parent_vectors, child_deltas, geometry, exp_dir):
         else torch.tensor(float("nan")),
     }
 
-    # Run control experiments
-    # Load unembedding matrix again for controls
-    control_model = AutoModelForCausalLM.from_pretrained(
-        config["model"]["name"],
-        low_cpu_mem_usage=True,
-        device_map={"": config["run"]["device"]},
-    )
-    if hasattr(control_model, "lm_head") and isinstance(
-        control_model.lm_head, torch.nn.Linear
-    ):
-        control_unembedding_matrix = control_model.lm_head.weight.data
-    else:
-        try:
-            control_unembedding_matrix = (
-                control_model.get_output_embeddings().weight.data
-            )
-        except Exception:
-            control_unembedding_matrix = (
-                control_model.get_input_embeddings().weight.data
-            )
-
+    # Run control experiments using preloaded unembedding matrix
     control_results = validator.run_control_experiments(
-        parent_vectors, child_deltas, control_unembedding_matrix, n_shuffles=50
+        parent_vectors, child_deltas, unembedding_matrix, n_shuffles=50
     )
 
     # Validate orthogonality with estimator function
@@ -505,14 +460,37 @@ def main():
     # Capture activations
     activations = capture_activations(config, hierarchies, exp_dir)
 
+    # Load transformer model once and derive unembedding matrix
+    model = AutoModelForCausalLM.from_pretrained(
+        config["model"]["name"],
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        device_map={"": config["run"]["device"]},
+    )
+    tokenizer = AutoTokenizer.from_pretrained(config["model"]["name"])
+    if hasattr(model, "lm_head") and isinstance(model.lm_head, torch.nn.Linear):
+        unembedding_matrix = model.lm_head.weight.data
+    else:
+        try:
+            unembedding_matrix = model.get_output_embeddings().weight.data
+        except Exception:
+            unembedding_matrix = model.get_input_embeddings().weight.data
+
     # Extract teacher vectors
     parent_vectors, child_deltas, projectors, geometry = extract_teacher_vectors(
-        config, hierarchies, activations, exp_dir
+        config, hierarchies, activations, exp_dir, unembedding_matrix
     )
 
     # Validate geometry
     validation_results = validate_geometry(
-        config, parent_vectors, child_deltas, geometry, exp_dir
+        config,
+        parent_vectors,
+        child_deltas,
+        geometry,
+        exp_dir,
+        model,
+        tokenizer,
+        unembedding_matrix,
     )
 
     # Final report
@@ -525,6 +503,12 @@ def main():
         logger.warning(
             "❌ Geometric validation FAILED - check results before proceeding"
         )
+
+    # Cleanup
+    del model
+    if tokenizer is not None:
+        del tokenizer
+    torch.cuda.empty_cache()
 
     return validation_results["passes_validation"]
 
