@@ -271,6 +271,15 @@ class CausalGeometry:
         norm = self.causal_norm(x)
         return x / (norm + 1e-8)
 
+    def unit_c(self, x: torch.Tensor) -> torch.Tensor:
+        """Whiten ``x`` and return unit vector in causal space."""
+        w = self.whiten(x)
+        if w.ndim == 1:
+            denom = torch.linalg.norm(w) + 1e-8
+        else:
+            denom = torch.linalg.norm(w, dim=-1, keepdim=True) + 1e-8
+        return w / denom
+
     def random_rotate(self, x: torch.Tensor, angle_deg: float) -> torch.Tensor:
         """Rotate ``x`` by a given angle in a random causal-orthogonal direction."""
         angle = angle_deg * torch.pi / 180.0

@@ -40,18 +40,23 @@ class LDAEstimator:
         self.class_balance = class_balance
 
     def estimate_binary_direction(
-        self, X_pos: torch.Tensor, X_neg: torch.Tensor, geometry
+        self,
+        X_pos: torch.Tensor,
+        X_neg: torch.Tensor,
+        geometry,
+        normalize: bool = True,
     ) -> torch.Tensor:
-        """
-        Estimate LDA direction for binary classification in causal space.
+        """Estimate LDA direction for binary classification in causal space.
 
         Args:
-            X_pos: Positive examples [N_pos, d]
-            X_neg: Negative examples [N_neg, d]
+            X_pos: Positive examples ``[N_pos, d]``
+            X_neg: Negative examples ``[N_neg, d]``
             geometry: CausalGeometry instance for whitening
+            normalize: Whether to normalize under the causal norm before
+                returning.
 
         Returns:
-            LDA direction vector normalized under causal norm
+            LDA direction vector. Normalized if ``normalize`` is ``True``.
         """
         # Whiten the data
         X_pos_whitened = geometry.whiten(X_pos)
@@ -99,7 +104,9 @@ class LDAEstimator:
         direction = direction.to(torch.float32)
 
         direction_original = direction @ geometry.W.T
-        return geometry.normalize_causal(direction_original)
+        if normalize:
+            return geometry.normalize_causal(direction_original)
+        return direction_original
 
     def estimate_multiclass_directions(
         self,
@@ -175,6 +182,12 @@ class ConceptVectorEstimator:
         """
         self.lda_estimator = lda_estimator or LDAEstimator()
         self.geometry = geometry
+        # Store raw, unnormalized parent vectors for delta computation
+        self.parent_raw_vectors: Dict[str, torch.Tensor] = {}
+        self.parent_whitened_vectors: Dict[str, torch.Tensor] = {}
+        self.child_raw_vectors: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.child_vectors: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.child_whitened_vectors: Dict[str, Dict[str, torch.Tensor]] = {}
 
     def estimate_parent_vectors(
         self, parent_activations: Dict[str, Dict[str, torch.Tensor]]
@@ -196,10 +209,16 @@ class ConceptVectorEstimator:
             X_pos = data["pos"]  # Activations where parent concept is present
             X_neg = data["neg"]  # Activations where parent concept is absent
 
-            parent_vector = self.lda_estimator.estimate_binary_direction(
-                X_pos, X_neg, self.geometry
+            # Get raw parent vector first
+            parent_vector_raw = self.lda_estimator.estimate_binary_direction(
+                X_pos, X_neg, self.geometry, normalize=False
             )
+            # Whiten and normalize in causal metric
+            parent_whitened = self.geometry.unit_c(parent_vector_raw)
+            parent_vector = self.geometry.unwhiten(parent_whitened)
             parent_vectors[parent_id] = parent_vector
+            self.parent_raw_vectors[parent_id] = parent_vector_raw
+            self.parent_whitened_vectors[parent_id] = parent_whitened
 
         return parent_vectors
 
@@ -224,9 +243,20 @@ class ConceptVectorEstimator:
             if parent_id not in parent_vectors:
                 logger.warning(f"No parent vector for {parent_id}, skipping children")
                 continue
+            parent_vector_raw = self.parent_raw_vectors.get(parent_id)
+            parent_whitened = self.parent_whitened_vectors.get(parent_id)
+            if parent_vector_raw is None or parent_whitened is None:
+                logger.warning(
+                    f"Raw or whitened parent vector for {parent_id} not found; using normalized vector"
+                )
+                parent_vector_raw = parent_vectors[parent_id]
+                parent_whitened = self.geometry.unit_c(parent_vector_raw)
 
-            parent_vector = parent_vectors[parent_id]
             child_deltas[parent_id] = {}
+            if parent_id not in self.child_raw_vectors:
+                self.child_raw_vectors[parent_id] = {}
+                self.child_vectors[parent_id] = {}
+                self.child_whitened_vectors[parent_id] = {}
 
             for child_id, data in children_data.items():
                 logger.info(f"Estimating child delta for {parent_id}/{child_id}")
@@ -234,14 +264,21 @@ class ConceptVectorEstimator:
                 X_pos = data["pos"]  # Activations where child concept is present
                 X_neg = data["neg"]  # Activations where child concept is absent
 
-                # Estimate child vector
-                child_vector = self.lda_estimator.estimate_binary_direction(
-                    X_pos, X_neg, self.geometry
+                # Estimate child vector in raw space
+                child_vector_raw = self.lda_estimator.estimate_binary_direction(
+                    X_pos, X_neg, self.geometry, normalize=False
                 )
 
-                # Compute delta: δ_{c|p} = ℓ_c - ℓ_p
-                delta_vector = child_vector - parent_vector
+                child_whitened = self.geometry.unit_c(child_vector_raw)
+                delta_whitened = child_whitened - parent_whitened
+                delta_whitened = delta_whitened / (torch.linalg.norm(delta_whitened) + 1e-8)
+                delta_vector = self.geometry.unwhiten(delta_whitened)
                 child_deltas[parent_id][child_id] = delta_vector
+
+                # Store vectors for controls and logging
+                self.child_raw_vectors[parent_id][child_id] = child_vector_raw
+                self.child_vectors[parent_id][child_id] = self.geometry.unwhiten(child_whitened)
+                self.child_whitened_vectors[parent_id][child_id] = child_whitened
 
         return child_deltas
 
@@ -340,11 +377,15 @@ def validate_orthogonality(
     parent_vectors: Dict[str, torch.Tensor],
     child_deltas: Dict[str, Dict[str, torch.Tensor]],
     geometry,
+    child_vectors: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
 ) -> "OrthogonalityStats":
     """Validate hierarchical orthogonality: ⟨ℓ_p, δ_{c|p}⟩_c ≈ 0."""
 
-    inner_products: List[float] = []
+    cosines: List[float] = []
     angles: List[float] = []
+    parent_norms: List[float] = []
+    child_norms: List[float] = []
+    delta_norms: List[float] = []
 
     for parent_id, deltas in child_deltas.items():
         if parent_id not in parent_vectors:
@@ -353,20 +394,36 @@ def validate_orthogonality(
         parent_vector = parent_vectors[parent_id]
 
         for child_id, delta in deltas.items():
-            inner_prod = geometry.causal_inner_product(parent_vector, delta)
-            inner_products.append(inner_prod.item())
-            angle = geometry.causal_angle(parent_vector, delta)
-            angles.append(torch.rad2deg(angle).item())
+            parent_norm = geometry.causal_norm(parent_vector).item()
+            delta_norm = geometry.causal_norm(delta).item()
+            if child_vectors and parent_id in child_vectors and child_id in child_vectors[parent_id]:
+                child_norm = geometry.causal_norm(child_vectors[parent_id][child_id]).item()
+            else:
+                child_norm = float("nan")
 
-    inner_products_arr = np.array(inner_products)
+            cos_val = geometry.causal_inner_product(parent_vector, delta)
+            cos_val = torch.clamp(cos_val, -1.0, 1.0)
+            angle = torch.arccos(cos_val)
+
+            cosines.append(cos_val.item())
+            angles.append(torch.rad2deg(angle).item())
+            parent_norms.append(parent_norm)
+            child_norms.append(child_norm)
+            delta_norms.append(delta_norm)
+
+    cos_arr = np.array(cosines)
     angles_arr = np.array(angles)
+    parent_norms_arr = np.array(parent_norms)
+    child_norms_arr = np.array(child_norms)
+    delta_norms_arr = np.array(delta_norms)
 
     stats = OrthogonalityStats(
-        inner_products=inner_products_arr,
+        cosines=cos_arr,
         angles_deg=angles_arr,
-        mean_inner_product=np.mean(np.abs(inner_products_arr))
-        if inner_products_arr.size
-        else 0.0,
+        parent_norms=parent_norms_arr,
+        child_norms=child_norms_arr,
+        delta_norms=delta_norms_arr,
+        mean_inner_product=np.mean(np.abs(cos_arr)) if cos_arr.size else 0.0,
         median_angle_deg=np.median(angles_arr) if angles_arr.size else 0.0,
         q25_angle_deg=np.percentile(angles_arr, 25) if angles_arr.size else 0.0,
         q75_angle_deg=np.percentile(angles_arr, 75) if angles_arr.size else 0.0,
@@ -381,8 +438,11 @@ def validate_orthogonality(
 class OrthogonalityStats:
     """Container for orthogonality statistics with basic validation."""
 
-    inner_products: np.ndarray
+    cosines: np.ndarray
     angles_deg: np.ndarray
+    parent_norms: np.ndarray
+    child_norms: np.ndarray
+    delta_norms: np.ndarray
     mean_inner_product: float
     median_angle_deg: float
     q25_angle_deg: float
@@ -391,5 +451,5 @@ class OrthogonalityStats:
     fraction_orthogonal_85deg: float
 
     def validate(self) -> None:
-        if self.inner_products.shape != self.angles_deg.shape:
-            raise ValueError("Mismatched shapes for inner products and angles")
+        if self.cosines.shape != self.angles_deg.shape:
+            raise ValueError("Mismatched shapes for cosines and angles")

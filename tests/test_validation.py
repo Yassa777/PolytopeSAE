@@ -20,7 +20,10 @@ def test_hierarchical_orthogonality_returns_dataframe():
         "parent_id",
         "child_id",
         "angle_deg",
-        "inner_product",
+        "cosine",
+        "parent_norm",
+        "child_norm",
+        "delta_norm",
     }
     assert len(results["details"]) == 1
 

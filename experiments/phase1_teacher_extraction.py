@@ -222,7 +222,7 @@ def extract_teacher_vectors(config, hierarchies, activations, exp_dir, unembeddi
     with open(exp_dir / "teacher_vectors.json", "w") as f:
         json.dump(results, f, indent=2)
 
-    return parent_vectors, child_deltas, projectors, geometry
+    return parent_vectors, child_deltas, projectors, geometry, estimator
 
 
 def validate_geometry(
@@ -234,6 +234,10 @@ def validate_geometry(
     model,
     tokenizer,
     unembedding_matrix,
+    parent_raw_vectors=None,
+    child_raw_vectors=None,
+    child_vectors=None,
+    residual_acts=None,
 ):
     """Validate geometric claims with metric triangulation."""
     logger.info("Validating geometric claims with metric triangulation")
@@ -244,6 +248,28 @@ def validate_geometry(
     # Metric triangulation: test multiple geometry sources
     geometry_sources = ["from_unembedding"]  # Always include the main one
     triangulation_results = {}
+
+    if residual_acts is not None:
+        from polytope_hsae.geometry import CausalGeometry
+        act_geometry = CausalGeometry(
+            unembedding_matrix,
+            whitening="residual_acts",
+            shrinkage=config["geometry"]["shrinkage"],
+            residual_acts=residual_acts,
+        )
+        geometry_sources.append("from_activations")
+        act_validator = GeometryValidator(act_geometry)
+        act_ortho = act_validator.test_hierarchical_orthogonality(
+            parent_vectors,
+            child_deltas,
+            child_vectors=child_vectors,
+            threshold_degrees=config["eval"]["targets"]["median_angle_deg"],
+        )
+        triangulation_results["from_activations"] = {
+            "median_angle_deg": act_ortho["median_angle_deg"],
+            "fraction_above_80deg": act_ortho["fraction_above_threshold"],
+            "passes_threshold": act_ortho["median_angle_deg"] >= config["eval"]["targets"]["median_angle_deg"],
+        }
 
     # Try alternative geometry sources if model and tokenizer are provided
     # Skip for very large vocabularies to avoid OOM issues
@@ -317,6 +343,7 @@ def validate_geometry(
     orthogonality_results = validator.test_hierarchical_orthogonality(
         parent_vectors,
         child_deltas,
+        child_vectors=child_vectors,
         threshold_degrees=config["eval"]["targets"]["median_angle_deg"],
     )
 
@@ -348,26 +375,39 @@ def validate_geometry(
     # Reduce shuffles for large vocabularies to save memory
     n_shuffles = 10 if vocab_size > 100000 else 50
     control_results = validator.run_control_experiments(
-        parent_vectors, child_deltas, unembedding_matrix, n_shuffles=n_shuffles
+        parent_vectors,
+        child_deltas,
+        unembedding_matrix,
+        parent_raw_vectors=parent_raw_vectors,
+        child_raw_vectors=child_raw_vectors,
+        n_shuffles=n_shuffles,
     )
 
     # Validate orthogonality with estimator function
     orthogonality_validation = validate_orthogonality(
-        parent_vectors, child_deltas, geometry
+        parent_vectors, child_deltas, geometry, child_vectors=child_vectors
     )
 
     # Add standard geometry results to triangulation
     triangulation_results["from_unembedding"] = {
         "median_angle_deg": orthogonality_results["median_angle_deg"],
         "fraction_above_80deg": orthogonality_results["fraction_above_threshold"],
-        "passes_threshold": orthogonality_results["median_angle_deg"] >= config["eval"]["targets"]["median_angle_deg"]
+        "passes_threshold": orthogonality_results["median_angle_deg"] >= config["eval"]["targets"]["median_angle_deg"],
     }
-    
-    # Compute triangulation consensus: pass if ≥2/3 geometries agree
-    passing_geometries = sum(1 for result in triangulation_results.values() if result["passes_threshold"])
-    triangulation_passes = passing_geometries >= max(2, len(triangulation_results) * 2 // 3)
-    
-    logger.info(f"Metric triangulation: {passing_geometries}/{len(triangulation_results)} geometries pass")
+
+    # Compute triangulation consensus: need ≥2 sources passing and medians within 15°
+    passing_sources = [
+        res for res in triangulation_results.values() if res["passes_threshold"]
+    ]
+    if len(passing_sources) >= 2:
+        medians = [res["median_angle_deg"] for res in passing_sources]
+        triangulation_passes = max(medians) - min(medians) <= 15.0
+    else:
+        triangulation_passes = False
+
+    logger.info(
+        f"Metric triangulation: {len(passing_sources)}/{len(triangulation_results)} geometries pass"
+    )
     logger.info(f"Triangulation consensus: {'PASS' if triangulation_passes else 'FAIL'}")
 
     # Compile results
@@ -471,6 +511,11 @@ def main():
 
     # Capture activations
     activations = capture_activations(config, hierarchies, exp_dir)
+    residual_list = []
+    for v in activations.values():
+        residual_list.append(v["pos"])
+        residual_list.append(v["neg"])
+    residual_acts = torch.cat(residual_list, dim=0)
 
     # Load transformer model once and derive unembedding matrix
     model = AutoModelForCausalLM.from_pretrained(
@@ -489,7 +534,7 @@ def main():
             unembedding_matrix = model.get_input_embeddings().weight.data
 
     # Extract teacher vectors
-    parent_vectors, child_deltas, projectors, geometry = extract_teacher_vectors(
+    parent_vectors, child_deltas, projectors, geometry, estimator = extract_teacher_vectors(
         config, hierarchies, activations, exp_dir, unembedding_matrix
     )
 
@@ -503,6 +548,10 @@ def main():
         model,
         tokenizer,
         unembedding_matrix,
+        parent_raw_vectors=estimator.parent_raw_vectors,
+        child_raw_vectors=estimator.child_raw_vectors,
+        child_vectors=estimator.child_vectors,
+        residual_acts=residual_acts,
     )
 
     # Final report
