@@ -68,14 +68,18 @@ class ActivationCapture:
                 config.model_name,
                 config=self.hf_config,
                 torch_dtype=config.dtype,
-            ).to(self.device)
+                low_cpu_mem_usage=True,
+                device_map={"": config.device},
+            )
         except Exception:
             from transformers import AutoModel
             self.model = AutoModel.from_pretrained(
                 config.model_name,
                 config=self.hf_config,
                 torch_dtype=config.dtype,
-            ).to(self.device)
+                low_cpu_mem_usage=True,
+                device_map={"": config.device},
+            )
             
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 

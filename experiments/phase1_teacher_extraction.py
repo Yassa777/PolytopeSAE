@@ -148,7 +148,11 @@ def extract_teacher_vectors(config, hierarchies, activations, exp_dir):
     logger.info("Extracting teacher vectors")
 
     # Use a model with an LM head so we can reliably find the unembedding & logits
-    model = AutoModelForCausalLM.from_pretrained(config["model"]["name"])
+    model = AutoModelForCausalLM.from_pretrained(
+        config["model"]["name"],
+        low_cpu_mem_usage=True,
+        device_map={"": config["run"]["device"]},
+    )
 
     # Prefer the model's lm_head when present
     if hasattr(model, "lm_head") and isinstance(model.lm_head, torch.nn.Linear):
@@ -250,7 +254,11 @@ def validate_geometry(config, parent_vectors, child_deltas, geometry, exp_dir):
     # Try alternative geometry sources if enabled
     try:
         # Load model for alternative geometries
-        model = AutoModelForCausalLM.from_pretrained(config["model"]["name"])
+        model = AutoModelForCausalLM.from_pretrained(
+            config["model"]["name"],
+            low_cpu_mem_usage=True,
+            device_map={"": config["run"]["device"]},
+        )
         tokenizer = AutoTokenizer.from_pretrained(config["model"]["name"])
         
         # Create dummy prompts for geometry validation
@@ -353,7 +361,11 @@ def validate_geometry(config, parent_vectors, child_deltas, geometry, exp_dir):
 
     # Run control experiments
     # Load unembedding matrix again for controls
-    control_model = AutoModelForCausalLM.from_pretrained(config["model"]["name"])
+    control_model = AutoModelForCausalLM.from_pretrained(
+        config["model"]["name"],
+        low_cpu_mem_usage=True,
+        device_map={"": config["run"]["device"]},
+    )
     if hasattr(control_model, "lm_head") and isinstance(
         control_model.lm_head, torch.nn.Linear
     ):
