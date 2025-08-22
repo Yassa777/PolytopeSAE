@@ -21,15 +21,22 @@ import torch
 import wandb
 import yaml
 from tqdm import tqdm
+from torch.utils.data import Subset
 
-from polytope_hsae.activations import ActivationCapture
-from polytope_hsae.metrics import (compute_comprehensive_metrics,
-                                   compute_explained_variance,
-                                   log_metrics_summary)
+from polytope_hsae.activations import HDF5ActivationsDataset
+from polytope_hsae.metrics import (
+    compute_comprehensive_metrics,
+    compute_explained_variance,
+    log_metrics_summary,
+)
 # Project imports
 from polytope_hsae.models import HierarchicalSAE, HSAEConfig
 from polytope_hsae.sanity_checker import TrainingSanityChecker
-from polytope_hsae.training import HSAETrainer, TrainingRestartException, create_data_loader
+from polytope_hsae.training import (
+    HSAETrainer,
+    TrainingRestartException,
+    create_data_loader,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,7 +60,7 @@ def setup_experiment(config):
 
 
 def load_activations(config, exp_dir):
-    """Load activations from Phase 1."""
+    """Create a streaming dataset of Phase 1 activations."""
     activations_file = (
         Path(config["logging"]["save_dir"])
         / config["logging"]["phase_1_log"]
@@ -63,21 +70,15 @@ def load_activations(config, exp_dir):
     if not activations_file.exists():
         raise FileNotFoundError(f"Activations not found: {activations_file}")
 
-    logger.info(f"Loading activations from {activations_file}")
+    logger.info(f"Using activation dataset {activations_file}")
 
-    activations = ActivationCapture.load_hierarchical_activations(str(activations_file))
+    dataset = HDF5ActivationsDataset(
+        str(activations_file),
+        unit_norm=config.get("data", {}).get("unit_norm", False),
+    )
+    logger.info(f"Activation dataset provides {len(dataset)} samples")
 
-    # Convert to training format
-    all_activations = []
-    for concept_id, pos_neg_dict in activations.items():
-        # Use both positive and negative examples for training
-        all_activations.append(pos_neg_dict["pos"])
-        all_activations.append(pos_neg_dict["neg"])
-
-    combined_activations = torch.cat(all_activations, dim=0)
-    logger.info(f"Loaded {combined_activations.shape[0]} activation samples")
-
-    return combined_activations
+    return dataset
 
 
 def create_baseline_hsae(config, input_dim: int):
@@ -112,7 +113,7 @@ def create_baseline_hsae(config, input_dim: int):
     return model
 
 
-def train_baseline_hsae_with_sanity_checks(model, activations, config, exp_dir):
+def train_baseline_hsae_with_sanity_checks(model, dataset, config, exp_dir):
     """Train baseline H-SAE with automated sanity checking and restart capability."""
     max_attempts = 3
     attempt = 0
@@ -122,7 +123,7 @@ def train_baseline_hsae_with_sanity_checks(model, activations, config, exp_dir):
         logger.info(f"🚀 Starting baseline H-SAE training (attempt {attempt}/{max_attempts})")
         
         try:
-            results = _train_baseline_hsae_single_attempt(model, activations, config, exp_dir, attempt)
+            results = _train_baseline_hsae_single_attempt(model, dataset, config, exp_dir, attempt)
             logger.info("✅ Training completed successfully!")
             return results
             
@@ -134,7 +135,7 @@ def train_baseline_hsae_with_sanity_checks(model, activations, config, exp_dir):
             
             # Recreate model with updated config
             logger.info("🔧 Recreating model with updated configuration...")
-            model = create_baseline_hsae(config, activations.shape[1])
+            model = create_baseline_hsae(config, dataset.feature_dim)
             continue
             
         except Exception as e:
@@ -143,8 +144,7 @@ def train_baseline_hsae_with_sanity_checks(model, activations, config, exp_dir):
     
     raise RuntimeError("Training failed after all attempts")
 
-
-def _train_baseline_hsae_single_attempt(model, activations, config, exp_dir, attempt_num):
+def _train_baseline_hsae_single_attempt(model, dataset, config, exp_dir, attempt_num):
     """Single training attempt with sanity checking."""
     logger.info(f"Starting baseline H-SAE training (attempt {attempt_num})")
 
@@ -152,30 +152,26 @@ def _train_baseline_hsae_single_attempt(model, activations, config, exp_dir, att
     device = torch.device(config["run"]["device"])
     model = model.to(device)
 
-    # Unit normalize if specified
-    if config.get("data", {}).get("unit_norm", False):
-        activations = torch.nn.functional.normalize(activations, dim=-1)
-
     # Split data (70/15/15 as per config spec)
-    n_samples = activations.shape[0]
+    n_samples = len(dataset)
     n_train = int(0.70 * n_samples)
     n_val = int(0.15 * n_samples)
     n_test = n_samples - n_train - n_val
 
-    train_activations = activations[:n_train]
-    val_activations = activations[n_train:n_train + n_val]
-    test_activations = activations[n_train + n_val:]
-    
+    train_ds = Subset(dataset, range(n_train))
+    val_ds = Subset(dataset, range(n_train, n_train + n_val))
+    test_ds = Subset(dataset, range(n_train + n_val, n_samples))
+
     logger.info(f"Data split: train={n_train}, val={n_val}, test={n_test} samples")
 
     train_loader = create_data_loader(
-        train_activations,
+        train_ds,
         batch_size=config["training"]["batch_size_acts"],
         device=config["run"]["device"],
         shuffle=True,
     )
     val_loader = create_data_loader(
-        val_activations,
+        val_ds,
         batch_size=config["training"]["batch_size_acts"],
         device=config["run"]["device"],
         shuffle=False,
@@ -432,13 +428,13 @@ def main():
     exp_dir = setup_experiment(config)
 
     # Load activations from Phase 1
-    activations = load_activations(config, exp_dir)
+    activation_ds = load_activations(config, exp_dir)
 
     # Create baseline H-SAE
-    model = create_baseline_hsae(config, input_dim=activations.shape[1])
+    model = create_baseline_hsae(config, input_dim=activation_ds.feature_dim)
 
     # Train baseline H-SAE with sanity checking
-    results = train_baseline_hsae_with_sanity_checks(model, activations, config, exp_dir)
+    results = train_baseline_hsae_with_sanity_checks(model, activation_ds, config, exp_dir)
 
     # Report final performance (no hard success gate)
     final_ev = 1.0 - results["final_metrics"].get("1-EV", 1.0)
