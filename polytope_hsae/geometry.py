@@ -22,68 +22,61 @@ class CausalGeometry:
     def __init__(
         self,
         unembedding_matrix: torch.Tensor,
+        whitening: str = "unembedding_rows",
         shrinkage: float = 0.05,
+        residual_acts: Optional[torch.Tensor] = None,
         cov_device: str = "cpu",
         cache_dir: Optional[str] = None,
     ):
         """
-        Initialize causal geometry with unembedding matrix.
+        Initialize causal geometry.
 
         Args:
             unembedding_matrix: U ∈ R^{V×d} unembedding matrix
-            shrinkage: Shrinkage parameter for covariance regularization
-            cov_device: Device used for covariance computation
-            cache_dir: Optional directory to cache Σ and W for reuse
+            whitening: Source of covariance (unembedding_rows | residual_acts | diagonal | identity)
+            shrinkage: Shrinkage parameter for covariance
+            residual_acts: Optional residual activations when whitening="residual_acts"
+            cov_device: Device for covariance computation
+            cache_dir: Optional cache directory
         """
+        self.whitening = whitening
         self.shrinkage = shrinkage
         self.device = unembedding_matrix.device
         self.dtype = torch.float32
         self.cov_device = cov_device
         self.cache_dir = cache_dir
         self.U = unembedding_matrix.detach()
+        self.residual_acts = residual_acts
 
         # Compute whitening matrix
-        self.Sigma, self.W = self._compute_whitening_matrix(self.U)
+        self.Sigma, self.W = self._compute_whitening_matrix()
 
-    def _compute_whitening_matrix(
-        self, unembedding_matrix: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute covariance matrix Σ and whitening matrix W = Σ^{-1/2}.
+    def _compute_whitening_matrix(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute covariance matrix Σ and whitening matrix W."""
+        dim = self.U.shape[1]
 
-        Args:
-            unembedding_matrix: Unembedding matrix
+        if self.whitening == "identity":
+            Sigma = torch.eye(dim, device=self.cov_device)
+            W = torch.eye(dim, device=self.cov_device)
+            return Sigma, W
 
-        Returns:
-            Tuple of (Sigma, W) tensors
-        """
-        sigma_file = w_file = None
-        if self.cache_dir is not None:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            sigma_file = os.path.join(self.cache_dir, "sigma.pt")
-            w_file = os.path.join(self.cache_dir, "whitening.pt")
-            if os.path.exists(sigma_file) and os.path.exists(w_file):
-                logger.info("Loading cached whitening matrices from disk")
-                Sigma = torch.load(sigma_file, map_location=self.cov_device)
-                W = torch.load(w_file, map_location=self.cov_device)
-                return Sigma, W
+        if self.whitening == "residual_acts" and self.residual_acts is not None:
+            data = self.residual_acts.to(self.cov_device, dtype=torch.float32)
+        else:
+            data = self.U.to(self.cov_device, dtype=torch.float32)
 
-        logger.info("Computing whitening matrix from unembedding rows")
+        data = data - data.mean(dim=0, keepdim=True)
 
-        U = unembedding_matrix.detach().to(self.cov_device, dtype=torch.float32)
-        U_centered = U - U.mean(dim=0, keepdim=True)
-        Sigma = torch.cov(U_centered.T) + self.shrinkage * torch.eye(
-            U.shape[1], device=self.cov_device
-        )
+        if self.whitening == "diagonal":
+            var = data.var(dim=0, unbiased=True) + self.shrinkage
+            Sigma = torch.diag(var)
+            W = torch.diag(1.0 / torch.sqrt(var))
+            return Sigma, W
 
+        Sigma = torch.cov(data.T) + self.shrinkage * torch.eye(dim, device=self.cov_device)
         eigenvals, eigenvecs = torch.linalg.eigh(Sigma)
         eigenvals = torch.clamp(eigenvals, min=1e-8)
         W = eigenvecs @ torch.diag(1.0 / torch.sqrt(eigenvals)) @ eigenvecs.T
-
-        if sigma_file is not None and w_file is not None:
-            torch.save(Sigma.cpu(), sigma_file)
-            torch.save(W.cpu(), w_file)
-
         return Sigma, W
 
     def whiten(self, x: torch.Tensor) -> torch.Tensor:
@@ -149,6 +142,20 @@ class CausalGeometry:
         """Normalize vector under causal norm."""
         norm = self.causal_norm(x)
         return x / (norm + 1e-8)
+
+    def random_rotate(self, x: torch.Tensor, angle_deg: float) -> torch.Tensor:
+        """Rotate ``x`` by a given angle in a random causal-orthogonal direction."""
+        angle = angle_deg * torch.pi / 180.0
+        w = self.whiten(x)
+        if torch.allclose(w, torch.zeros_like(w)):
+            return x
+        rand = torch.randn_like(w)
+        rand -= (rand @ w) / (w @ w) * w
+        rand = rand / (rand.norm() + 1e-8)
+        w_norm = w / (w.norm() + 1e-8)
+        rotated = w_norm * torch.cos(angle) + rand * torch.sin(angle)
+        rotated = rotated * w.norm()
+        return self.unwhiten(rotated.unsqueeze(0)).squeeze(0)
 
     def to(self, device: str):
         """Move geometry matrices to specified device for training."""

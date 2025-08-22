@@ -129,8 +129,8 @@ class HSAETrainer:
             else contextlib.nullcontext()
         )
         with autocast_ctx:
-            x_hat, (_, _), metrics = self.model(x)
-            loss_dict = self._compute_total_loss(x, x_hat, metrics, stage)
+            x_hat, (parent_codes, _), metrics = self.model(x)
+            loss_dict = self._compute_total_loss(x, x_hat, metrics, stage, parent_codes)
 
         self._optimizer_step(loss_dict["total_loss"])
 
@@ -138,7 +138,12 @@ class HSAETrainer:
         if hasattr(self.model, "update_router_temperature"):
             self.model.update_router_temperature(self.step, total_steps)
         if hasattr(self.model, "normalize_decoder_weights"):
-            self.model.normalize_decoder_weights()
+            # Support both causal and euclidean normalization based on config
+            normalize_mode = self.config.get("hsae", {}).get("normalize_decoder", "euclidean")
+            if normalize_mode == "causal" and self.geometry is not None:
+                self.model.normalize_decoder_weights(self.geometry)
+            else:
+                self.model.normalize_decoder_weights()
 
         self.step += 1
 
@@ -178,9 +183,33 @@ class HSAETrainer:
         x_hat: torch.Tensor,
         metrics: Dict[str, torch.Tensor],
         stage: str,
+        parent_codes: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        recon_loss = metrics["reconstruction_loss"]
+        # Support causal space reconstruction based on config
+        recon_space = (
+            self.config.get("losses", {}).get("reconstruction_space", "euclidean")
+        )
+        if recon_space == "causal" and self.geometry is not None:
+            self.geometry.to(str(batch.device))
+            recon_loss = F.mse_loss(
+                self.geometry.whiten(x_hat), self.geometry.whiten(batch)
+            )
+            if parent_codes is not None:
+                parent_recon = self.model.router.decode(
+                    parent_codes, self.model.config.use_tied_decoders_parent
+                )
+                if self.model.config.use_decoder_bias:
+                    parent_recon += self.model.decoder_bias
+                top_level_recon = F.mse_loss(
+                    self.geometry.whiten(parent_recon), self.geometry.whiten(batch)
+                )
+            else:
+                top_level_recon = metrics.get("top_level_recon_loss", torch.tensor(0.0))
+        else:
+            recon_loss = metrics["reconstruction_loss"]
+            top_level_recon = metrics.get("top_level_recon_loss", torch.tensor(0.0))
 
+        # Apply L1 warmup
         l1_mult = self._get_l1_multiplier(self.step)
         l1_loss = l1_mult * (metrics["l1_parent"] + metrics["l1_child"])
 
@@ -189,13 +218,24 @@ class HSAETrainer:
             hasattr(self.model.config, "top_level_beta")
             and self.model.config.top_level_beta > 0
         ):
-            top_level_loss = self.model.config.top_level_beta * metrics["top_level_recon_loss"]
+            top_level_loss = self.model.config.top_level_beta * top_level_recon
 
         biorth_loss = metrics.get("biorth_penalty", torch.zeros((), device=batch.device))
 
         causal_ortho_loss = torch.zeros((), device=batch.device)
+        # Support stage-specific causal orthogonality control for ablations
+        stage_conf = self.config.get("training", {}).get("teacher_init", {})
+        enable_causal = False
+        if stage == "stabilize":
+            enable_causal = stage_conf.get("stage_A", {}).get(
+                "enable_causal_ortho", True
+            )
+        elif stage == "adapt":
+            enable_causal = stage_conf.get("stage_B", {}).get(
+                "enable_causal_ortho", False
+            )
         if (
-            stage == "stabilize"
+            enable_causal
             and hasattr(self.model.config, "causal_ortho_lambda")
             and self.model.config.causal_ortho_lambda > 0
             and self.geometry is not None
@@ -360,8 +400,16 @@ class HSAETrainer:
         train_iter = iter(train_loader)
 
         try:
+            stage_A_cfg = (
+                self.config.get("training", {})
+                .get("teacher_init", {})
+                .get("stage_A", {})
+            )
             logger.info("Stage A: Stabilizing with frozen decoder")
-            self._freeze_decoder_weights()
+            if stage_A_cfg.get("freeze_decoder", True):
+                self._freeze_decoder_weights()
+            else:
+                self._unfreeze_decoder_weights()
             train_iter = self._run_stage(
                 train_iter,
                 train_loader,
@@ -374,8 +422,16 @@ class HSAETrainer:
                 sanity_checker=sanity_checker,
             )
 
+            stage_B_cfg = (
+                self.config.get("training", {})
+                .get("teacher_init", {})
+                .get("stage_B", {})
+            )
             logger.info("Stage B: Adapting with unfrozen decoder")
-            self._unfreeze_decoder_weights()
+            if stage_B_cfg.get("freeze_decoder", False):
+                self._freeze_decoder_weights()
+            else:
+                self._unfreeze_decoder_weights()
             decoder_lr_mult = (
                 self.config["training"].get("teacher_init", {}).get("decoder_lr_mult", 1.0)
             )
@@ -448,23 +504,31 @@ class HSAETrainer:
 
     def _freeze_decoder_weights(self):
         """Freeze decoder weights for stabilization phase."""
-        if not self.model.config.use_tied_decoders_parent:
+        parts = self.config.get("hsae", {}).get(
+            "freeze_parts", ["parent_decoder", "child_decoders", "projectors"]
+        )
+        if "parent_decoder" in parts and not self.model.config.use_tied_decoders_parent:
             self.model.router.decoder.weight.requires_grad = False
         for sub in self.model.subspaces:
-            if not self.model.config.use_tied_decoders_child:
+            if "child_decoders" in parts and not self.model.config.use_tied_decoders_child:
                 sub.decoder.weight.requires_grad = False
-            if not self.model.config.tie_projectors:
+            if "projectors" in parts and not self.model.config.tie_projectors:
                 sub.up_projector.weight.requires_grad = False
+                sub.down_projector.weight.requires_grad = False
 
     def _unfreeze_decoder_weights(self):
         """Unfreeze decoder weights for adaptation phase."""
-        if not self.model.config.use_tied_decoders_parent:
+        parts = self.config.get("hsae", {}).get(
+            "freeze_parts", ["parent_decoder", "child_decoders", "projectors"]
+        )
+        if "parent_decoder" in parts and not self.model.config.use_tied_decoders_parent:
             self.model.router.decoder.weight.requires_grad = True
         for sub in self.model.subspaces:
-            if not self.model.config.use_tied_decoders_child:
+            if "child_decoders" in parts and not self.model.config.use_tied_decoders_child:
                 sub.decoder.weight.requires_grad = True
-            if not self.model.config.tie_projectors:
+            if "projectors" in parts and not self.model.config.tie_projectors:
                 sub.up_projector.weight.requires_grad = True
+                sub.down_projector.weight.requires_grad = True
 
     def _set_decoder_lr(self, lr: float):
         """Set different learning rate for decoder parameters."""
