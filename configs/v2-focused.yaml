@@ -134,7 +134,7 @@ ablate:
 
 logging:
   save_dir: "runs/v2_focused"
-  log_every: 20               # Throttled logging (every 20 steps)
+  log_every: 50               # Throttled logging (every 50 steps)
   checkpoint_every: 2000      # Less frequent checkpointing
   keep_last_k: 3
   
