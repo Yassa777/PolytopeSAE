@@ -88,6 +88,8 @@ class CausalGeometry:
 
     def whiten(self, x: torch.Tensor) -> torch.Tensor:
         """Apply whitening transformation: x̃ = Wx."""
+        if x.ndim not in (1, 2):
+            raise ValueError("whiten expects a 1D or 2D tensor")
         W = self.W.to(
             x.device, dtype=x.dtype if x.dtype.is_floating_point else torch.float32
         )
@@ -95,8 +97,11 @@ class CausalGeometry:
 
     def unwhiten(self, x_whitened: torch.Tensor) -> torch.Tensor:
         """Apply inverse whitening transformation: x = x̃W^{-1} = x̃W^T."""
+        if x_whitened.ndim not in (1, 2):
+            raise ValueError("unwhiten expects a 1D or 2D tensor")
         W = self.W.to(
-            x_whitened.device, dtype=x_whitened.dtype if x_whitened.dtype.is_floating_point else torch.float32
+            x_whitened.device,
+            dtype=x_whitened.dtype if x_whitened.dtype.is_floating_point else torch.float32,
         )
         return x_whitened @ W
 
@@ -110,6 +115,10 @@ class CausalGeometry:
         Returns:
             Causal inner product
         """
+        if x.ndim not in (1, 2) or y.ndim not in (1, 2):
+            raise ValueError("inputs must be 1D or 2D tensors")
+        if x.ndim != y.ndim or x.shape[-1] != y.shape[-1]:
+            raise ValueError("inputs must have matching shapes")
         x_whitened = self.whiten(x)
         y_whitened = self.whiten(y)
         return torch.sum(x_whitened * y_whitened, dim=-1)
