@@ -219,18 +219,27 @@ class ConceptVectorEstimator:
         self,
         parent_vectors: Dict[str, torch.Tensor],
         child_activations: Dict[str, Dict[str, Dict[str, torch.Tensor]]],
-    ) -> Dict[str, Dict[str, torch.Tensor]]:
-        """
-        Estimate child delta vectors δ_{c|p} = ℓ_c - ℓ_p.
+    ) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Dict[str, Dict[str, torch.Tensor]]]:
+        """Estimate child directions and their deltas in causal space.
+
+        Both parent and child vectors are first normalized under the causal
+        metric before forming ``δ = ℓ_c - ℓ_p`` which is again normalized in the
+        causal norm. This ensures all returned vectors have unit causal norm,
+        making inner products comparable to cosines.
 
         Args:
-            parent_vectors: Dict mapping parent_id -> parent_vector
-            child_activations: Dict mapping parent_id -> child_id -> {'pos': tensor, 'neg': tensor}
+            parent_vectors: Dict mapping parent_id -> parent_vector (already
+                causal-normalized)
+            child_activations: Dict mapping parent_id -> child_id ->
+                {'pos': tensor, 'neg': tensor}
 
         Returns:
-            Dict mapping parent_id -> child_id -> delta_vector
+            Tuple of dictionaries ``(child_vectors, child_deltas)`` where each
+            entry maps ``parent_id -> child_id -> tensor``.
         """
-        child_deltas = {}
+
+        child_vectors: Dict[str, Dict[str, torch.Tensor]] = {}
+        child_deltas: Dict[str, Dict[str, torch.Tensor]] = {}
 
         for parent_id, children_data in child_activations.items():
             if parent_id not in parent_vectors:
@@ -242,7 +251,9 @@ class ConceptVectorEstimator:
                     f"Raw parent vector for {parent_id} not found; using normalized vector"
                 )
                 parent_vector_raw = parent_vectors[parent_id]
-            
+
+            parent_vector = parent_vectors[parent_id]
+            child_vectors[parent_id] = {}
             child_deltas[parent_id] = {}
 
             for child_id, data in children_data.items():
@@ -251,16 +262,20 @@ class ConceptVectorEstimator:
                 X_pos = data["pos"]  # Activations where child concept is present
                 X_neg = data["neg"]  # Activations where child concept is absent
 
-                # Estimate child vector in raw space
+                # Estimate child vector in raw space then normalize causally
                 child_vector_raw = self.lda_estimator.estimate_binary_direction(
                     X_pos, X_neg, self.geometry, normalize=False
                 )
+                child_vector = self.geometry.normalize_causal(child_vector_raw)
 
-                # Compute delta using raw vectors: δ_{c|p} = ℓ_c - ℓ_p
-                delta_vector = child_vector_raw - parent_vector_raw
+                # Compute and normalize delta: δ_{c|p} = ℓ_c - ℓ_p
+                delta_vector = child_vector - parent_vector
+                delta_vector = self.geometry.normalize_causal(delta_vector)
+
+                child_vectors[parent_id][child_id] = child_vector
                 child_deltas[parent_id][child_id] = delta_vector
 
-        return child_deltas
+        return child_vectors, child_deltas
 
     def estimate_child_subspace_projectors(
         self,
