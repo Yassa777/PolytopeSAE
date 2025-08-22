@@ -215,26 +215,14 @@ def create_teacher_hsae(config, input_dim: int, parent_vectors, child_deltas, pr
 
 
 def load_geometry(config):
-    """Load geometry from Phase 1 for causal orthogonality."""
-    try:
-        from transformers import AutoModelForCausalLM
-
-        model = AutoModelForCausalLM.from_pretrained(config["model"]["name"])
-        if hasattr(model, "lm_head"):
-            unembedding_matrix = model.lm_head.weight.data
-        else:
-            unembedding_matrix = model.get_output_embeddings().weight.data
-    except Exception as e:
-        logger.warning(f"Could not load geometry: {e}")
+    """Load precomputed geometry from Phase 1."""
+    phase1_dir = Path(config["logging"]["save_dir"]) / config["logging"]["phase_1_log"]
+    geometry_file = phase1_dir / "geometry.pt"
+    if not geometry_file.exists():
+        logger.warning(f"Geometry file not found: {geometry_file}")
         return None
 
-    geometry = CausalGeometry(
-        unembedding_matrix,
-        whitening=config.get("geometry", {}).get("whitening", "unembedding_rows"),
-        shrinkage=config["geometry"].get("shrinkage", 0.05),
-    )
-
-    return geometry
+    return CausalGeometry.load(str(geometry_file))
 
 
 def train_teacher_hsae_with_sanity_checks(model, dataset, config, exp_dir, geometry):
