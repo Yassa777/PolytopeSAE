@@ -85,19 +85,20 @@ class LDAEstimator:
         X_centered = torch.cat([X_pos_centered, X_neg_centered], dim=0)
 
         # Within-class scatter with shrinkage
-        S_w = torch.cov(X_centered.T) + self.shrinkage * torch.eye(X_centered.shape[1])
+        S_w = torch.cov(X_centered.T) + self.shrinkage * torch.eye(
+            X_centered.shape[1], dtype=X_centered.dtype, device=X_centered.device
+        )
 
+        S_w_f32 = S_w.to(torch.float32)
+        mean_diff = (mu_pos - mu_neg).to(torch.float32)
         try:
-            # LDA direction: S_w^{-1} (μ_1 - μ_0)
-            direction = torch.linalg.solve(S_w, mu_pos - mu_neg)
+            direction = torch.linalg.solve(S_w_f32, mean_diff)
         except torch.linalg.LinAlgError:
             logger.warning("Singular within-class scatter matrix, using pseudoinverse")
-            direction = torch.linalg.pinv(S_w) @ (mu_pos - mu_neg)
+            direction = torch.linalg.pinv(S_w_f32) @ mean_diff
+        direction = direction.to(torch.float32)
 
-        # Transform back to original space and normalize
-        direction_original = (
-            direction @ geometry.W.T
-        )  # W^T maps whitened back to original
+        direction_original = direction @ geometry.W.T
         return geometry.normalize_causal(direction_original)
 
     def estimate_multiclass_directions(
