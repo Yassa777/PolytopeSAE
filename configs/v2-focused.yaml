@@ -110,9 +110,9 @@ training:
       enable_causal_ortho: false
       decoder_lr_mult: 0.5  # Lower LR for decoder adaptation
     
-    # Override sanity checker for teacher-init (enable with relaxed settings)
+    # Override sanity checker for teacher-init (disable to prevent restarts)
     sanity_checker:
-      enabled: true
+      enabled: false
       check_interval: 1500     # Very delayed checks for teacher-init stability
       max_restarts: 1
       min_route_usage_pct: 15  # Gentle for teacher-init early stages

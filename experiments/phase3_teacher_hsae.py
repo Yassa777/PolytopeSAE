@@ -364,8 +364,13 @@ def _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry
         teacher_config.setdefault("sanity_checker", {}).update(teacher_init_sanity)
         logger.info("🔍 Using teacher_init specific sanity checker settings")
     
-    sanity_checker = TrainingSanityChecker(teacher_config, model, trainer, exp_dir)
-    logger.info("🔍 Sanity checker initialized")
+    scfg = teacher_config.get("sanity_checker", {})
+    if scfg.get("enabled", True):
+        sanity_checker = TrainingSanityChecker(teacher_config, model, trainer, exp_dir)
+        logger.info("🔍 Sanity checker initialized")
+    else:
+        sanity_checker = None
+        logger.info("🔕 Sanity checker DISABLED for teacher-init")
 
     # Initialize W&B
     if trainer.use_wandb:
