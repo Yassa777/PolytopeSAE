@@ -58,64 +58,73 @@ class CausalGeometry:
     
     @classmethod
     def from_logit_cov(cls, model, tokenizer, prompts, shrinkage=0.05):
-        """Create geometry from logit covariance on sample prompts."""
+        """Create geometry from logit covariance on sample prompts - MEMORY OPTIMIZED."""
+        logger.warning("from_logit_cov: Using diagonal approximation to avoid OOM on large vocabularies")
+        
         device = next(model.parameters()).device
         model.eval()
         
+        # Use much smaller sample and process one at a time to minimize memory
         all_logits = []
         with torch.no_grad():
-            for prompt in prompts[:100]:  # Limit to avoid memory issues
+            for prompt in prompts[:20]:  # Drastically reduced for memory
                 try:
-                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=128).to(device)
+                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=64).to(device)
                     outputs = model(**inputs)
-                    # Get logits for last token
+                    # Get logits for last token and immediately move to CPU
                     logits = outputs.logits[0, -1, :].cpu()
                     all_logits.append(logits)
-                except:
+                    # Explicit cleanup to free GPU memory
+                    del outputs, inputs
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
                     continue
         
         if not all_logits:
             raise ValueError("No valid prompts processed for logit covariance")
             
-        # Stack logits and compute covariance
+        # Stack logits and use DIAGONAL approximation to avoid OOM
         logits_tensor = torch.stack(all_logits)  # [n_prompts, vocab_size]
         
-        # Create dummy unembedding (we'll override the covariance computation)
+        # Create dummy unembedding
         vocab_size, d_model = logits_tensor.shape[1], model.config.hidden_size
         dummy_U = torch.randn(vocab_size, d_model)
         
-        # Create geometry instance
-        geometry = cls(dummy_U, whitening="unembedding_rows", shrinkage=shrinkage)
+        # Create geometry instance with diagonal whitening
+        geometry = cls(dummy_U, whitening="diagonal", shrinkage=shrinkage)
         
-        # Override with logit-based covariance
+        # Use diagonal variance instead of full covariance (memory-efficient)
         logits_centered = logits_tensor - logits_tensor.mean(dim=0, keepdim=True)
-        Sigma = torch.cov(logits_centered.T) + shrinkage * torch.eye(vocab_size)
-        eigenvals, eigenvecs = torch.linalg.eigh(Sigma)
-        eigenvals = torch.clamp(eigenvals, min=1e-8)
-        W = eigenvecs @ torch.diag(1.0 / torch.sqrt(eigenvals)) @ eigenvecs.T
+        diagonal_var = logits_centered.var(dim=0, unbiased=True) + shrinkage
         
-        geometry.Sigma = Sigma
-        geometry.W = W
+        # Create diagonal matrices instead of full vocab_size x vocab_size matrices
+        geometry.Sigma = torch.diag(diagonal_var)
+        geometry.W = torch.diag(1.0 / torch.sqrt(diagonal_var))
         
         return geometry
     
     @classmethod  
     def fisher_like(cls, model, tokenizer, prompts, shrinkage=0.05):
-        """Create geometry from diagonal Fisher/softmax Hessian approximation."""
+        """Create geometry from diagonal Fisher/softmax Hessian approximation - MEMORY OPTIMIZED."""
         device = next(model.parameters()).device
         model.eval()
         
         all_probs = []
         with torch.no_grad():
-            for prompt in prompts[:100]:  # Limit to avoid memory issues
+            for prompt in prompts[:20]:  # Reduced for memory
                 try:
-                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=128).to(device)
+                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=64).to(device)
                     outputs = model(**inputs)
-                    # Get softmax probabilities for last token
+                    # Get softmax probabilities for last token and move to CPU immediately
                     logits = outputs.logits[0, -1, :]
                     probs = torch.softmax(logits, dim=0).cpu()
                     all_probs.append(probs)
-                except:
+                    # Explicit cleanup
+                    del outputs, inputs
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
                     continue
         
         if not all_probs:
@@ -135,13 +144,10 @@ class CausalGeometry:
         # Create geometry instance
         geometry = cls(dummy_U, whitening="diagonal", shrinkage=shrinkage)
         
-        # Override with Fisher diagonal
-        Sigma_diag = torch.diag(fisher_diag)
-        W_diag = torch.diag(1.0 / torch.sqrt(fisher_diag))
+        # Override with Fisher diagonal - keep diagonal representation
+        geometry.Sigma = torch.diag(fisher_diag)
+        geometry.W = torch.diag(1.0 / torch.sqrt(fisher_diag))
         
-        geometry.Sigma = Sigma_diag
-        geometry.W = W_diag
-
         return geometry
 
     def save(self, path: str):

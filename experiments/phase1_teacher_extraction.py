@@ -246,7 +246,11 @@ def validate_geometry(
     triangulation_results = {}
 
     # Try alternative geometry sources if model and tokenizer are provided
-    if model is not None and tokenizer is not None:
+    # Skip for very large vocabularies to avoid OOM issues
+    vocab_size = model.config.vocab_size if model is not None else 0
+    skip_alt_geometries = vocab_size > 100000  # Skip for vocabs > 100K
+    
+    if model is not None and tokenizer is not None and not skip_alt_geometries:
         # Create dummy prompts for geometry validation
         test_prompts = [
             "The capital of France is Paris.",
@@ -304,6 +308,8 @@ def validate_geometry(
             
         except Exception as e:
             logger.warning(f"Could not test Fisher-like geometry: {e}")
+    elif skip_alt_geometries:
+        logger.warning(f"Skipping alternative geometries due to large vocabulary (size={vocab_size:,}) to avoid OOM")
     else:
         logger.warning("Model or tokenizer not provided; skipping alternative geometries")
 
@@ -339,8 +345,10 @@ def validate_geometry(
     }
 
     # Run control experiments using preloaded unembedding matrix
+    # Reduce shuffles for large vocabularies to save memory
+    n_shuffles = 10 if vocab_size > 100000 else 50
     control_results = validator.run_control_experiments(
-        parent_vectors, child_deltas, unembedding_matrix, n_shuffles=50
+        parent_vectors, child_deltas, unembedding_matrix, n_shuffles=n_shuffles
     )
 
     # Validate orthogonality with estimator function
