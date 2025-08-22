@@ -46,6 +46,8 @@ class HSAEConfig:
     router_temp_start: float = 1.5
     router_temp_end: float = 0.7
     normalize_decoder: bool = True
+    # "euclidean" or "causal" normalization of decoder columns
+    normalize_decoder_mode: str = "euclidean"
     top_level_beta: float = 0.1
 
     # JAX-compatibility toggles
@@ -55,6 +57,8 @@ class HSAEConfig:
     use_decoder_bias: bool = True
     use_offdiag_biorth: bool = False  # Use off-diagonal-only cross-orthogonality
     use_gradient_checkpointing: bool = False
+    # Routing behaviour: "hard" (Top-K with ST) or "soft" mixture
+    routing_forward_mode: str = "hard"
 
 
 class StandardSAE(nn.Module):
@@ -213,7 +217,10 @@ class HierarchicalSAE(nn.Module):
         self._initialize_weights()
 
     def _sample_codes(self, logits: torch.Tensor, k: int) -> torch.Tensor:
-        """Sample Top-K codes with optional Gumbel noise."""
+        """Sample codes according to routing mode."""
+        if self.config.routing_forward_mode == "soft":
+            return F.softmax(logits / (self.router_temperature + 1e-8), dim=-1)
+
         if k == 1:
             if self.training:
                 return F.gumbel_softmax(logits, tau=self.router_temperature, hard=True)
@@ -221,6 +228,7 @@ class HierarchicalSAE(nn.Module):
             idx = logits.argmax(dim=-1, keepdim=True)
             codes.scatter_(-1, idx, 1.0)
             return codes
+
         if self.training:
             noise = torch.rand_like(logits)
             gumbel = -torch.log(-torch.log(noise.clamp_min(1e-8)).clamp_min(1e-8))
@@ -232,6 +240,7 @@ class HierarchicalSAE(nn.Module):
             soft_masked = soft * hard_mask
             soft_masked = soft_masked / (soft_masked.sum(dim=-1, keepdim=True) + 1e-8)
             return (hard_mask - soft_masked).detach() + soft_masked
+
         topk_vals, topk_idx = torch.topk(logits, k, dim=-1)
         codes = torch.zeros_like(logits)
         codes.scatter_(-1, topk_idx, 1.0)
@@ -261,6 +270,12 @@ class HierarchicalSAE(nn.Module):
         parent_vectors: torch.Tensor,
         child_projectors: List[Tuple[torch.Tensor, torch.Tensor]],
         geometry=None,
+        child_deltas: Optional[torch.Tensor] = None,
+        seed_parent_decoder: bool = True,
+        seed_child_decoder: bool = True,
+        seed_projectors: bool = True,
+        child_mode: str = "delta",
+        init_jitter_deg: float = 0.0,
     ):
         """
         Initialize decoder weights from teacher vectors.
@@ -273,24 +288,46 @@ class HierarchicalSAE(nn.Module):
         logger.info("Initializing H-SAE from teacher vectors")
 
         with torch.no_grad():
-            self.router.decoder.weight.copy_(parent_vectors.T)
+            if init_jitter_deg > 0 and geometry is not None:
+                for i in range(parent_vectors.shape[0]):
+                    parent_vectors[i] = geometry.random_rotate(parent_vectors[i], init_jitter_deg)
+                if child_deltas is not None:
+                    for i in range(child_deltas.shape[0]):
+                        for j in range(child_deltas.shape[1]):
+                            child_deltas[i, j] = geometry.random_rotate(child_deltas[i, j], init_jitter_deg)
 
-            if geometry is not None:
-                for i in range(self.config.n_parents):
-                    parent_vec = self.router.decoder.weight[:, i]
-                    normalized_vec = geometry.normalize_causal(parent_vec)
-                    self.router.decoder.weight[:, i] = normalized_vec
+            if seed_parent_decoder:
+                self.router.decoder.weight.copy_(parent_vectors.T)
+                if geometry is not None:
+                    for i in range(self.config.n_parents):
+                        parent_vec = self.router.decoder.weight[:, i]
+                        normalized_vec = geometry.normalize_causal(parent_vec)
+                        self.router.decoder.weight[:, i] = normalized_vec
 
-            for i, (down_proj, up_proj) in enumerate(child_projectors):
-                if i >= self.config.n_parents:
-                    break
+            if seed_projectors:
+                for i, (down_proj, up_proj) in enumerate(child_projectors):
+                    if i >= self.config.n_parents:
+                        break
+                    sub = self.subspaces[i]
+                    sub.down_projector.weight.copy_(down_proj)
+                    sub.up_projector.weight.copy_(up_proj)
+
+            for i in range(self.config.n_parents):
                 sub = self.subspaces[i]
-                sub.down_projector.weight.copy_(down_proj)
-                sub.up_projector.weight.copy_(up_proj)
-
-                nn.init.orthogonal_(sub.decoder.weight)
-                child_norms = torch.norm(sub.decoder.weight, dim=0, keepdim=True)
-                sub.decoder.weight.div_(child_norms + 1e-8)
+                if seed_child_decoder and child_deltas is not None and i < child_deltas.shape[0]:
+                    for j in range(min(self.config.n_children_per_parent, child_deltas.shape[1])):
+                        delta = child_deltas[i, j]
+                        if child_mode == "absolute" and seed_parent_decoder and i < parent_vectors.shape[0]:
+                            vec = delta
+                        else:
+                            vec = delta
+                        sub.decoder.weight[:, j] = sub.down_projector.weight @ vec
+                    child_norms = torch.norm(sub.decoder.weight, dim=0, keepdim=True)
+                    sub.decoder.weight.div_(child_norms + 1e-8)
+                else:
+                    nn.init.orthogonal_(sub.decoder.weight)
+                    child_norms = torch.norm(sub.decoder.weight, dim=0, keepdim=True)
+                    sub.decoder.weight.div_(child_norms + 1e-8)
 
     def encode_parent(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -519,10 +556,30 @@ class HierarchicalSAE(nn.Module):
 
         return self.config.causal_ortho_lambda * penalty
 
-    def normalize_decoder_weights(self):
+    def normalize_decoder_weights(self, geometry=None):
         """Normalize decoder columns to unit norm."""
-        if self.config.normalize_decoder:
-            with torch.no_grad():
+        if not self.config.normalize_decoder:
+            return
+        with torch.no_grad():
+            if self.config.normalize_decoder_mode == "causal" and geometry is not None:
+                for i in range(self.config.n_parents):
+                    col = self.router.decoder.weight[:, i]
+                    self.router.decoder.weight[:, i] = geometry.normalize_causal(col)
+
+                for sub in self.subspaces:
+                    for j in range(self.config.n_children_per_parent):
+                        col = sub.decoder.weight[:, j]
+                        if self.config.tie_projectors:
+                            full = F.linear(col.unsqueeze(0), sub.down_projector.weight).squeeze(0)
+                        else:
+                            full = sub.up_projector(col.unsqueeze(0)).squeeze(0)
+                        full = geometry.normalize_causal(full)
+                        if self.config.tie_projectors:
+                            col_new = F.linear(full.unsqueeze(0), sub.down_projector.weight.t()).squeeze(0)
+                        else:
+                            col_new = sub.down_projector.weight @ full
+                        sub.decoder.weight[:, j] = col_new
+            else:
                 parent_norms = torch.norm(
                     self.router.decoder.weight, dim=0, keepdim=True
                 )
@@ -575,10 +632,26 @@ def create_teacher_initialized_hsae(
     parent_vectors: torch.Tensor,
     child_projectors: List[Tuple[torch.Tensor, torch.Tensor]],
     geometry=None,
+    child_deltas: Optional[torch.Tensor] = None,
+    seed_parent_decoder: bool = True,
+    seed_child_decoder: bool = True,
+    seed_projectors: bool = True,
+    child_mode: str = "delta",
+    init_jitter_deg: float = 0.0,
 ) -> HierarchicalSAE:
     """Create teacher-initialized H-SAE."""
     hsae = HierarchicalSAE(config)
-    hsae.initialize_from_teacher(parent_vectors, child_projectors, geometry)
+    hsae.initialize_from_teacher(
+        parent_vectors,
+        child_projectors,
+        geometry,
+        child_deltas=child_deltas,
+        seed_parent_decoder=seed_parent_decoder,
+        seed_child_decoder=seed_child_decoder,
+        seed_projectors=seed_projectors,
+        child_mode=child_mode,
+        init_jitter_deg=init_jitter_deg,
+    )
     return hsae
 
 
@@ -589,21 +662,25 @@ def count_parameters(model: nn.Module) -> int:
 
 def freeze_decoder_weights(model: HierarchicalSAE):
     """Freeze decoder weights for stabilization phase."""
-    if not model.config.use_tied_decoders_parent:
+    parts = getattr(model.config, "freeze_parts", ["parent_decoder", "child_decoders", "projectors"])
+    if "parent_decoder" in parts and not model.config.use_tied_decoders_parent:
         model.router.decoder.weight.requires_grad = False
     for sub in model.subspaces:
-        if not model.config.use_tied_decoders_child:
+        if "child_decoders" in parts and not model.config.use_tied_decoders_child:
             sub.decoder.weight.requires_grad = False
-        if not model.config.tie_projectors:
+        if "projectors" in parts and not model.config.tie_projectors:
             sub.up_projector.weight.requires_grad = False
+            sub.down_projector.weight.requires_grad = False
 
 
 def unfreeze_decoder_weights(model: HierarchicalSAE):
     """Unfreeze decoder weights for adaptation phase."""
-    if not model.config.use_tied_decoders_parent:
+    parts = getattr(model.config, "freeze_parts", ["parent_decoder", "child_decoders", "projectors"])
+    if "parent_decoder" in parts and not model.config.use_tied_decoders_parent:
         model.router.decoder.weight.requires_grad = True
     for sub in model.subspaces:
-        if not model.config.use_tied_decoders_child:
+        if "child_decoders" in parts and not model.config.use_tied_decoders_child:
             sub.decoder.weight.requires_grad = True
-        if not model.config.tie_projectors:
+        if "projectors" in parts and not model.config.tie_projectors:
             sub.up_projector.weight.requires_grad = True
+            sub.down_projector.weight.requires_grad = True

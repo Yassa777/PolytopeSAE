@@ -115,7 +115,7 @@ def load_activations(config, exp_dir):
     return combined_activations
 
 
-def create_teacher_hsae(config, input_dim: int, parent_vectors, projectors, geometry):
+def create_teacher_hsae(config, input_dim: int, parent_vectors, child_deltas, projectors, geometry):
     """Create teacher-initialized H-SAE."""
     hsae_config = HSAEConfig(
         input_dim=input_dim,
@@ -131,6 +131,9 @@ def create_teacher_hsae(config, input_dim: int, parent_vectors, projectors, geom
         router_temp_start=config["hsae"]["router_temp"]["start"],
         router_temp_end=config["hsae"]["router_temp"]["end"],
         top_level_beta=config["hsae"]["top_level_beta"],
+        normalize_decoder=config["hsae"].get("normalize_decoder", True),
+        normalize_decoder_mode=config["hsae"].get("normalize_decoder_mode", "euclidean"),
+        routing_forward_mode=config["hsae"].get("routing", {}).get("forward_mode", "hard"),
         # Use config settings or defaults
         use_tied_decoders_parent=config["hsae"].get("use_tied_decoders_parent", False),
         use_tied_decoders_child=config["hsae"].get("use_tied_decoders_child", False),
@@ -146,11 +149,30 @@ def create_teacher_hsae(config, input_dim: int, parent_vectors, projectors, geom
     # Convert projectors to list (take first N)
     projector_list = list(projectors.values())[: hsae_config.n_parents]
 
+    # Convert child deltas to tensor
+    child_tensor = torch.zeros(
+        hsae_config.n_parents, hsae_config.n_children_per_parent, input_dim
+    )
+    for i, deltas in enumerate(child_deltas.values()):
+        if i >= hsae_config.n_parents:
+            break
+        for j, delta in enumerate(deltas.values()):
+            if j >= hsae_config.n_children_per_parent:
+                break
+            child_tensor[i, j] = delta
+
+    teacher_cfg = config.get("teacher", {})
     model = create_teacher_initialized_hsae(
         config=hsae_config,
         parent_vectors=parent_tensor,
         child_projectors=projector_list,
         geometry=geometry,
+        child_deltas=child_tensor,
+        seed_parent_decoder=teacher_cfg.get("seed_parent_decoder", True),
+        seed_child_decoder=teacher_cfg.get("seed_child_decoder", True),
+        seed_projectors=teacher_cfg.get("seed_projectors", True),
+        child_mode=teacher_cfg.get("child_mode", "delta"),
+        init_jitter_deg=teacher_cfg.get("init_jitter_deg", 0.0),
     )
 
     logger.info(
@@ -175,7 +197,9 @@ def load_geometry(config):
         return None
 
     geometry = CausalGeometry(
-        unembedding_matrix, shrinkage=config["geometry"]["shrinkage"]
+        unembedding_matrix,
+        whitening=config.get("geometry", {}).get("whitening", "unembedding_rows"),
+        shrinkage=config["geometry"].get("shrinkage", 0.05),
     )
 
     return geometry
@@ -204,7 +228,9 @@ def train_teacher_hsae_with_sanity_checks(model, activations, config, exp_dir, g
             # Recreate model with updated config and teacher initialization
             logger.info("🔧 Recreating model with updated configuration...")
             parent_vectors, child_deltas, projectors = load_teacher_vectors(config)
-            model = create_teacher_hsae(config, activations.shape[1], parent_vectors, projectors, geometry)
+            model = create_teacher_hsae(
+                config, activations.shape[1], parent_vectors, child_deltas, projectors, geometry
+            )
             continue
             
         except Exception as e:
@@ -574,7 +600,7 @@ def main():
 
     # Create teacher-initialized H-SAE
     model = create_teacher_hsae(
-        config, activations.shape[1], parent_vectors, projectors, geometry
+        config, activations.shape[1], parent_vectors, child_deltas, projectors, geometry
     )
 
     # Train teacher-initialized H-SAE
