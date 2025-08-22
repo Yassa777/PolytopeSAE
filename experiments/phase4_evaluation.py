@@ -619,23 +619,13 @@ def run_ratio_invariance_tests(parent_vectors, child_deltas, causal_geometry, co
 def run_euclidean_vs_causal_ablation(parent_vectors, child_deltas, config, exp_dir):
     """Run ablation comparing Euclidean vs causal geometry."""
     logger.info("Running Euclidean vs Causal ablation")
-
+    phase1_dir = Path(config["logging"]["save_dir"]) / config["logging"]["phase_1_log"]
+    geometry_file = phase1_dir / "geometry.pt"
     try:
-        from transformers import AutoModelForCausalLM
-
-        model = AutoModelForCausalLM.from_pretrained(config["model"]["name"])
-        if hasattr(model, "lm_head"):
-            unembedding_matrix = model.lm_head.weight.data
-        else:
-            unembedding_matrix = model.get_output_embeddings().weight.data
+        causal_geometry = CausalGeometry.load(str(geometry_file))
     except Exception as e:
-        logger.error(f"Could not load model for geometry ablation: {e}")
+        logger.error(f"Could not load geometry for ablation: {e}")
         return {}
-
-    # Causal geometry
-    causal_geometry = CausalGeometry(
-        unembedding_matrix, shrinkage=config["geometry"]["shrinkage"]
-    )
 
     # Compare angles in both geometries
     euclidean_angles = []
