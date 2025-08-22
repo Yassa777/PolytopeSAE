@@ -306,6 +306,7 @@ class HSAETrainer:
                 if should_restart:
                     logger.info("🔄 Sanity checker requested training restart")
                     raise TrainingRestartException("Sanity checker applied fixes - restart needed")
+            # Logging
             if step % self.config["logging"]["log_every"] == 0:
                 history["train_loss"].append(metrics["total_loss"])
                 history["step"].append(global_step)
@@ -317,14 +318,17 @@ class HSAETrainer:
                     )
                     if stage != "main":
                         wandb.log({"stage": stage}, step=global_step)
-                if val_loader is not None:
-                    val_metrics = self.validate(val_loader)
-                    history["val_loss"].append(val_metrics["total_loss"])
-                    if self.use_wandb:
-                        wandb.log(
-                            {f"val/{k}": v for k, v in val_metrics.items()},
-                            step=global_step,
-                        )
+            
+            # Validation (less frequent than logging)
+            val_every = self.config["training"].get("val_every", self.config["logging"]["log_every"])
+            if step % val_every == 0 and val_loader is not None:
+                val_metrics = self.validate(val_loader)
+                history["val_loss"].append(val_metrics["total_loss"])
+                if self.use_wandb:
+                    wandb.log(
+                        {f"val/{k}": v for k, v in val_metrics.items()},
+                        step=global_step,
+                    )
 
             if (
                 self.config["logging"].get("checkpoint_every") is not None
