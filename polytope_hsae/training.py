@@ -496,6 +496,18 @@ class HSAETrainer:
                 )
 
         # Average metrics
+        if not val_metrics:
+            # Return default metrics if no validation batches were processed
+            logger.warning("No validation batches processed - returning default metrics")
+            return {
+                "total_loss": float('inf'),
+                "recon_loss": float('inf'),
+                "1-EV": 1.0,
+                "1-CE": float('inf'),
+                "parent_sparsity": 0.0,
+                "child_sparsity": 0.0,
+            }
+        
         avg_metrics = {}
         for key in val_metrics[0].keys():
             avg_metrics[key] = sum(m[key] for m in val_metrics) / len(val_metrics)
@@ -624,6 +636,7 @@ def create_data_loader(
     shuffle: bool = True,
     num_workers: Optional[int] = None,
     pin_memory: Optional[bool] = None,
+    drop_last: Optional[bool] = None,
 ) -> DataLoader:
     """Create a ``DataLoader`` for activation tensors or datasets.
 
@@ -648,6 +661,8 @@ def create_data_loader(
         num_workers = max(4, mp.cpu_count() // 2)
     if pin_memory is None:
         pin_memory = is_cuda
+    if drop_last is None:
+        drop_last = len(ds) >= batch_size  # only drop when we have >=1 full batch
 
     loader = DataLoader(
         ds,
@@ -657,6 +672,6 @@ def create_data_loader(
         pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
         prefetch_factor=4 if num_workers > 0 else None,
-        drop_last=True,
+        drop_last=drop_last,
     )
     return loader

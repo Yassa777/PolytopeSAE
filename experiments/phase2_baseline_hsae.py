@@ -183,6 +183,12 @@ def _train_baseline_hsae_single_attempt(model, dataset, config, exp_dir, attempt
         logger.info(f"   Reason: Training dataset has {n_train} samples")
         logger.info(f"   This ensures at least {n_train // batch_size} batches per epoch")
     
+    # Ensure validation batch size doesn't exceed validation dataset size
+    val_batch_size = min(batch_size, n_val) if n_val > 0 else batch_size
+    if val_batch_size != batch_size:
+        logger.info(f"🔧 Validation batch size adjusted: {batch_size} → {val_batch_size}")
+        logger.info(f"   Reason: Validation dataset has {n_val} samples")
+    
     train_loader = create_data_loader(
         train_ds,
         batch_size=batch_size,
@@ -191,9 +197,10 @@ def _train_baseline_hsae_single_attempt(model, dataset, config, exp_dir, attempt
     )
     val_loader = create_data_loader(
         val_ds,
-        batch_size=batch_size,
+        batch_size=val_batch_size,
         device=config["run"]["device"],
         shuffle=False,
+        drop_last=False,
     )
 
     # Initialize trainer
@@ -224,7 +231,8 @@ def _train_baseline_hsae_single_attempt(model, dataset, config, exp_dir, attempt
                 "model/n_parents": model.config.n_parents,
                 "model/subspace_dim": model.config.subspace_dim,
                 "model/topk_parent": model.config.topk_parent,
-            }
+            },
+            step=0,
         )
 
     # Training with sanity checking - support schedule-only freeze control
