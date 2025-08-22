@@ -17,10 +17,14 @@ echo "🐍 Setting up Python environment..."
 python3 -m pip install --upgrade pip
 python3 -m pip install virtualenv
 
-# Create and activate virtual environment
-echo "🔧 Creating virtual environment..."
-python3 -m venv /workspace/venv
-source /workspace/venv/bin/activate
+# Use persistent virtual environment (or create if not exists)
+echo "🔧 Setting up persistent virtual environment..."
+PERSISTENT_VENV="/workspace/polytope_env"
+if [ ! -d "$PERSISTENT_VENV" ]; then
+    echo "Creating new persistent environment..."
+    python3 -m venv "$PERSISTENT_VENV"
+fi
+source "$PERSISTENT_VENV/bin/activate"
 
 # Install PyTorch with CUDA support
 echo "🔥 Installing PyTorch with CUDA support..."
@@ -63,33 +67,46 @@ mkdir -p /workspace/polytope-hsae/checkpoints
 mkdir -p /workspace/polytope-hsae/logs
 mkdir -p /workspace/polytope-hsae/results
 
-# Set up environment variables
-echo "🌍 Setting up environment variables..."
+# Set up persistent environment variables and cache
+echo "🌍 Setting up persistent environment variables..."
 export CUDA_VISIBLE_DEVICES=0
 export TRANSFORMERS_CACHE="/workspace/cache/transformers"
 export HF_HOME="/workspace/cache/huggingface"
+export TORCH_HOME="/workspace/cache/torch"
+export PIP_CACHE_DIR="/workspace/.cache/pip"
+export NLTK_DATA="/workspace/nltk_data"
 export WANDB_PROJECT="polytope-hsae"
 
-# Create cache directories
+# Create persistent cache directories
 mkdir -p /workspace/cache/transformers
 mkdir -p /workspace/cache/huggingface
+mkdir -p /workspace/cache/torch
+mkdir -p /workspace/.cache/pip
+mkdir -p /workspace/nltk_data
 
 # Set up Weights & Biases (optional)
 echo "📊 Setting up Weights & Biases..."
 echo "To use W&B logging, run: wandb login"
 echo "Your API key can be found at: https://wandb.ai/authorize"
 
-# Create a startup script for future runs
-echo "📝 Creating startup script..."
+# Create a persistent startup script for future runs
+echo "📝 Creating persistent startup script..."
 cat > /workspace/startup.sh << 'EOF'
 #!/bin/bash
-source /workspace/venv/bin/activate
+# Activate persistent environment
+source /workspace/polytope_env/bin/activate
 cd /workspace/polytope-hsae
+
+# Set persistent cache locations
 export CUDA_VISIBLE_DEVICES=0
 export TRANSFORMERS_CACHE="/workspace/cache/transformers"
-export HF_HOME="/workspace/cache/huggingface"
+export HF_HOME="/workspace/cache/huggingface" 
+export TORCH_HOME="/workspace/cache/torch"
+export PIP_CACHE_DIR="/workspace/.cache/pip"
+export NLTK_DATA="/workspace/nltk_data"
 export WANDB_PROJECT="polytope-hsae"
-echo "🎯 Environment activated! Ready for experiments."
+
+echo "🎯 Persistent environment activated! Ready for experiments."
 echo "💡 Quick start:"
 echo "  - Run Phase 1: python experiments/phase1_teacher_extraction.py --config configs/v2-focused.yaml"
 echo "  - Run Phase 2: python experiments/phase2_baseline_hsae.py --config configs/v2-focused.yaml"
