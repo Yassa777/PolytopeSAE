@@ -164,15 +164,34 @@ def _train_baseline_hsae_single_attempt(model, dataset, config, exp_dir, attempt
 
     logger.info(f"Data split: train={n_train}, val={n_val}, test={n_test} samples")
 
+    # Auto-adjust batch size to ensure training can proceed
+    original_batch_size = config["training"]["batch_size_acts"]
+    max_safe_batch_size = n_train  # Maximum possible batch size
+    
+    # Choose a reasonable batch size that's safe
+    batch_size = min(original_batch_size, max_safe_batch_size)
+    
+    # Prefer common batch sizes for better performance
+    common_batch_sizes = [32, 64, 128, 256, 512, 1024, 2048, 4096]
+    for size in reversed(common_batch_sizes):
+        if size <= max_safe_batch_size:
+            batch_size = size
+            break
+    
+    if batch_size != original_batch_size:
+        logger.info(f"🔧 Auto-adjusted batch size: {original_batch_size} → {batch_size}")
+        logger.info(f"   Reason: Training dataset has {n_train} samples")
+        logger.info(f"   This ensures at least {n_train // batch_size} batches per epoch")
+    
     train_loader = create_data_loader(
         train_ds,
-        batch_size=config["training"]["batch_size_acts"],
+        batch_size=batch_size,
         device=config["run"]["device"],
         shuffle=True,
     )
     val_loader = create_data_loader(
         val_ds,
-        batch_size=config["training"]["batch_size_acts"],
+        batch_size=batch_size,
         device=config["run"]["device"],
         shuffle=False,
     )
