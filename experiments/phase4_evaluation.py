@@ -23,6 +23,7 @@ import yaml
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from polytope_hsae.activations import ActivationCapture
 from polytope_hsae.geometry import CausalGeometry
 from polytope_hsae.metrics import (compute_comprehensive_metrics,
                                    log_metrics_summary)
@@ -50,6 +51,179 @@ def setup_experiment(config):
 
     logger.info(f"Phase 4 experiment directory: {exp_dir}")
     return exp_dir
+
+
+def analyze_boundary_normal_alignment(model, val_loader, geometry, exp_dir, config):
+    """
+    Analyze boundary-normal alignment for direct test of normal-fan claim.
+    
+    For each parent: 
+    1) Build dataset of (down_project(x), argmax child) from val acts
+    2) Fit multinomial logistic regression in subspace -> per-class normals  
+    3) Map normals back up with up_projector; compare causal angles to teacher δ_{c|p}
+    
+    Args:
+        model: Trained H-SAE model
+        val_loader: Validation data loader
+        geometry: CausalGeometry instance
+        exp_dir: Experiment directory for saving results
+    """
+    logger.info("🔍 Analyzing boundary-normal alignment (normal-fan claim)")
+    
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import LabelEncoder
+    import matplotlib.pyplot as plt
+    
+    model.eval()
+    device = next(model.parameters()).device
+    
+    # Collect data for each parent
+    parent_data = {}  # parent_id -> {'projections': [], 'child_labels': []}
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            if batch_idx > 50:  # Limit for efficiency
+                break
+                
+            if isinstance(batch, (list, tuple)):
+                batch = batch[0]
+            batch = batch.to(device)
+            
+            # Forward pass to get routing decisions
+            x_hat, (parent_codes, child_codes), metrics = model(batch)
+            
+            # Get active parents and children
+            parent_indices = torch.nonzero(parent_codes > 0)  # [n_active, 2] (batch, parent)
+            
+            for batch_i, parent_i in parent_indices:
+                parent_id = f"parent_{parent_i.item()}"
+                
+                if parent_id not in parent_data:
+                    parent_data[parent_id] = {'projections': [], 'child_labels': [], 'parent_idx': parent_i.item()}
+                
+                # Get the activation for this sample
+                x_sample = batch[batch_i]  # [dim]
+                
+                # Project down to parent subspace
+                if hasattr(model, 'projectors') and parent_i.item() in model.projectors:
+                    down_proj, up_proj = model.projectors[parent_i.item()]
+                    x_proj = x_sample @ down_proj.T  # [subspace_dim]
+                    
+                    # Get child decision
+                    child_logits = model.child_encoders[parent_i.item()](x_proj.unsqueeze(0))  # [1, m_low]
+                    child_decision = torch.argmax(child_logits, dim=1).item()
+                    
+                    parent_data[parent_id]['projections'].append(x_proj.cpu().numpy())
+                    parent_data[parent_id]['child_labels'].append(child_decision)
+    
+    # Analyze each parent that has sufficient data
+    alignment_results = {}
+    angle_distributions = []
+    
+    for parent_id, data in parent_data.items():
+        if len(data['projections']) < 20:  # Need sufficient samples
+            continue
+            
+        logger.info(f"Analyzing parent {parent_id} with {len(data['projections'])} samples")
+        
+        X = np.array(data['projections'])  # [n_samples, subspace_dim]
+        y = np.array(data['child_labels'])  # [n_samples]
+        
+        # Check if we have multiple classes
+        unique_classes = np.unique(y)
+        if len(unique_classes) < 2:
+            continue
+        
+        try:
+            # Fit multinomial logistic regression
+            clf = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000)
+            clf.fit(X, y)
+            
+            # Get decision boundaries (normals in subspace)
+            normals_subspace = clf.coef_  # [n_classes, subspace_dim]
+            
+            # Map back to full space using up_projector
+            parent_idx = data['parent_idx']
+            if hasattr(model, 'projectors') and parent_idx in model.projectors:
+                down_proj, up_proj = model.projectors[parent_idx]
+                
+                # Map normals back up: n_full = up_proj @ n_subspace
+                normals_full = normals_subspace @ up_proj  # [n_classes, full_dim]
+                
+                # Compare with teacher child deltas
+                teacher_file = Path(config["logging"]["save_dir"]) / config["logging"]["phase_1_log"] / "teacher_vectors.json"
+                if teacher_file.exists():
+                    with open(teacher_file, 'r') as f:
+                        teacher_data = json.load(f)
+                    
+                    parent_key = f"parent_{parent_idx}"
+                    if parent_key in teacher_data.get("child_deltas", {}):
+                        child_deltas = teacher_data["child_deltas"][parent_key]
+                        
+                        # Compute angles between learned normals and teacher deltas
+                        angles = []
+                        for class_idx, normal in enumerate(normals_full):
+                            normal_tensor = torch.tensor(normal, dtype=torch.float32)
+                            
+                            # Find corresponding teacher delta (if exists)
+                            child_key = f"child_{class_idx}"
+                            if child_key in child_deltas:
+                                teacher_delta = torch.tensor(child_deltas[child_key], dtype=torch.float32)
+                                
+                                # Compute causal angle using geometry
+                                angle_rad = geometry.causal_angle(normal_tensor, teacher_delta)
+                                angle_deg = torch.rad2deg(angle_rad).item()
+                                angles.append(angle_deg)
+                        
+                        if angles:
+                            median_angle = np.median(angles)
+                            alignment_results[parent_id] = {
+                                'median_angle_deg': median_angle,
+                                'all_angles_deg': angles,
+                                'n_samples': len(data['projections']),
+                                'n_classes': len(unique_classes)
+                            }
+                            angle_distributions.extend(angles)
+                            
+                            logger.info(f"Parent {parent_id}: median angle = {median_angle:.1f}°")
+        
+        except Exception as e:
+            logger.warning(f"Failed to analyze parent {parent_id}: {e}")
+            continue
+    
+    # Save results
+    fan_alignment_file = exp_dir / "fan_alignment.json"
+    with open(fan_alignment_file, 'w') as f:
+        json.dump(alignment_results, f, indent=2)
+    
+    # Plot angle histogram
+    if angle_distributions:
+        plt.figure(figsize=(10, 6))
+        plt.hist(angle_distributions, bins=30, alpha=0.7, edgecolor='black')
+        plt.axvline(30, color='red', linestyle='--', label='30° threshold')
+        plt.xlabel('Angle between learned normal and teacher delta (degrees)')
+        plt.ylabel('Frequency')
+        plt.title('Boundary-Normal Alignment Analysis')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plot_file = exp_dir / "boundary_normal_alignment.png"
+        plt.savefig(plot_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        median_overall = np.median(angle_distributions)
+        logger.info(f"📊 Overall median angle: {median_overall:.1f}° (target: ≤30°)")
+        logger.info(f"💾 Saved alignment analysis to {fan_alignment_file}")
+        logger.info(f"📈 Saved angle histogram to {plot_file}")
+        
+        return {
+            'median_angle_deg': median_overall,
+            'angle_distribution': angle_distributions,
+            'per_parent_results': alignment_results
+        }
+    else:
+        logger.warning("No valid alignment data found")
+        return None
 
 
 def load_models_and_data(config):

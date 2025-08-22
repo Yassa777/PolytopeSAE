@@ -72,14 +72,16 @@ training:
   lr_warmup_steps: 1000      # Longer warmup for stability
   l1_warmup_steps: 2000      # Warmup L1 from 0 → target over 2k steps
   
-  # Baseline H-SAE training
+  # Baseline H-SAE training - MATCHED COMPUTE
   baseline:
-    total_steps: 12000       # 7000 → 12000 steps (more training)
+    total_steps: 15000       # EQUALIZED: same as teacher_init for fair comparison
     init_method: "random"
+    schedule_only_freeze: true  # run baseline with same freeze→adapt schedule
   
   # Teacher-initialized H-SAE training  
   teacher_init:
-    total_steps: 15000       # 10000 → 15000 (proportional increase)
+    total_steps: 15000       # MATCHED: same as baseline for fair comparison
+    teacher_noise_deg: [0, 5, 15, 30]  # ablation: angular noise on teacher
     stage_A:
       freeze_decoder: true
       steps: 2000            # 1500 → 2000 (proportional)

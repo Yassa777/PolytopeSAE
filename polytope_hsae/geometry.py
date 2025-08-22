@@ -51,6 +51,99 @@ class CausalGeometry:
         # Compute whitening matrix
         self.Sigma, self.W = self._compute_whitening_matrix()
 
+    @classmethod
+    def from_unembedding(cls, U, shrinkage=0.05):
+        """Create geometry from unembedding matrix (standard approach)."""
+        return cls(U, whitening="unembedding_rows", shrinkage=shrinkage)
+    
+    @classmethod
+    def from_logit_cov(cls, model, tokenizer, prompts, shrinkage=0.05):
+        """Create geometry from logit covariance on sample prompts."""
+        device = next(model.parameters()).device
+        model.eval()
+        
+        all_logits = []
+        with torch.no_grad():
+            for prompt in prompts[:100]:  # Limit to avoid memory issues
+                try:
+                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=128).to(device)
+                    outputs = model(**inputs)
+                    # Get logits for last token
+                    logits = outputs.logits[0, -1, :].cpu()
+                    all_logits.append(logits)
+                except:
+                    continue
+        
+        if not all_logits:
+            raise ValueError("No valid prompts processed for logit covariance")
+            
+        # Stack logits and compute covariance
+        logits_tensor = torch.stack(all_logits)  # [n_prompts, vocab_size]
+        
+        # Create dummy unembedding (we'll override the covariance computation)
+        vocab_size, d_model = logits_tensor.shape[1], model.config.hidden_size
+        dummy_U = torch.randn(vocab_size, d_model)
+        
+        # Create geometry instance
+        geometry = cls(dummy_U, whitening="unembedding_rows", shrinkage=shrinkage)
+        
+        # Override with logit-based covariance
+        logits_centered = logits_tensor - logits_tensor.mean(dim=0, keepdim=True)
+        Sigma = torch.cov(logits_centered.T) + shrinkage * torch.eye(vocab_size)
+        eigenvals, eigenvecs = torch.linalg.eigh(Sigma)
+        eigenvals = torch.clamp(eigenvals, min=1e-8)
+        W = eigenvecs @ torch.diag(1.0 / torch.sqrt(eigenvals)) @ eigenvecs.T
+        
+        geometry.Sigma = Sigma
+        geometry.W = W
+        
+        return geometry
+    
+    @classmethod  
+    def fisher_like(cls, model, tokenizer, prompts, shrinkage=0.05):
+        """Create geometry from diagonal Fisher/softmax Hessian approximation."""
+        device = next(model.parameters()).device
+        model.eval()
+        
+        all_probs = []
+        with torch.no_grad():
+            for prompt in prompts[:100]:  # Limit to avoid memory issues
+                try:
+                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=128).to(device)
+                    outputs = model(**inputs)
+                    # Get softmax probabilities for last token
+                    logits = outputs.logits[0, -1, :]
+                    probs = torch.softmax(logits, dim=0).cpu()
+                    all_probs.append(probs)
+                except:
+                    continue
+        
+        if not all_probs:
+            raise ValueError("No valid prompts processed for Fisher approximation")
+            
+        # Stack probabilities and compute diagonal Fisher approximation
+        probs_tensor = torch.stack(all_probs)  # [n_prompts, vocab_size]
+        
+        # Diagonal Fisher: E[p(1-p)] for each vocabulary item
+        mean_probs = probs_tensor.mean(dim=0)
+        fisher_diag = mean_probs * (1 - mean_probs) + shrinkage
+        
+        # Create dummy unembedding
+        vocab_size, d_model = len(mean_probs), model.config.hidden_size
+        dummy_U = torch.randn(vocab_size, d_model)
+        
+        # Create geometry instance
+        geometry = cls(dummy_U, whitening="diagonal", shrinkage=shrinkage)
+        
+        # Override with Fisher diagonal
+        Sigma_diag = torch.diag(fisher_diag)
+        W_diag = torch.diag(1.0 / torch.sqrt(fisher_diag))
+        
+        geometry.Sigma = Sigma_diag
+        geometry.W = W_diag
+        
+        return geometry
+
     def _compute_whitening_matrix(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute covariance matrix Σ and whitening matrix W."""
         dim = self.U.shape[1]

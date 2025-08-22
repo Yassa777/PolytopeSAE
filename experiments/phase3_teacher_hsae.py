@@ -55,8 +55,20 @@ def setup_experiment(config):
     return exp_dir
 
 
-def load_teacher_vectors(config):
-    """Load teacher vectors from Phase 1."""
+def add_angular_noise(vec, deg):
+    """Add angular noise to a vector by rotating it by a specified angle."""
+    if deg <= 0:
+        return vec
+    v = vec / (vec.norm() + 1e-8)
+    r = torch.randn_like(v)
+    r = r - (r @ v) * v  # Make orthogonal to v
+    r = r / (r.norm() + 1e-8)
+    theta = deg * torch.pi / 180
+    return (torch.cos(theta) * v + torch.sin(theta) * r) * vec.norm()
+
+
+def load_teacher_vectors(config, noise_deg=0.0):
+    """Load teacher vectors from Phase 1, optionally with angular noise."""
     phase1_dir = Path(config["logging"]["save_dir"]) / config["logging"]["phase_1_log"]
     teacher_file = phase1_dir / "teacher_vectors.json"
 
@@ -64,6 +76,8 @@ def load_teacher_vectors(config):
         raise FileNotFoundError(f"Teacher vectors not found: {teacher_file}")
 
     logger.info(f"Loading teacher vectors from {teacher_file}")
+    if noise_deg > 0:
+        logger.info(f"Adding {noise_deg}° angular noise to teacher vectors")
 
     with open(teacher_file, "r") as f:
         teacher_data = json.load(f)
@@ -80,6 +94,19 @@ def load_teacher_vectors(config):
         parent_id: (torch.tensor(proj["down"]), torch.tensor(proj["up"]))
         for parent_id, proj in teacher_data["projectors"].items()
     }
+
+    # Add noise if specified
+    if noise_deg > 0:
+        # Add noise to parent vectors
+        for k in parent_vectors:
+            parent_vectors[k] = add_angular_noise(parent_vectors[k], noise_deg)
+        
+        # Add noise to child deltas
+        for parent_id in child_deltas:
+            for child_id in child_deltas[parent_id]:
+                child_deltas[parent_id][child_id] = add_angular_noise(
+                    child_deltas[parent_id][child_id], noise_deg
+                )
 
     logger.info(
         f"Loaded {len(parent_vectors)} parent vectors and {sum(len(deltas) for deltas in child_deltas.values())} child deltas"
@@ -589,22 +616,43 @@ def main():
     # Set up experiment
     exp_dir = setup_experiment(config)
 
-    # Load teacher vectors from Phase 1
-    parent_vectors, child_deltas, projectors = load_teacher_vectors(config)
-
     # Load geometry for causal orthogonality
     geometry = load_geometry(config)
 
     # Load activations from Phase 1
     activations = load_activations(config, exp_dir)
 
-    # Create teacher-initialized H-SAE
-    model = create_teacher_hsae(
-        config, activations.shape[1], parent_vectors, child_deltas, projectors, geometry
-    )
+    # Get noise levels for teacher ablation
+    noise_levels = config["training"]["teacher_init"].get("teacher_noise_deg", [0])
+    if not isinstance(noise_levels, list):
+        noise_levels = [noise_levels]
 
-    # Train teacher-initialized H-SAE
-    results = train_teacher_hsae_with_sanity_checks(model, activations, config, exp_dir, geometry)
+    all_results = {}
+    
+    # Run experiments for each noise level
+    for noise_deg in noise_levels:
+        logger.info(f"🎯 Running experiment with teacher noise: {noise_deg}°")
+        
+        # Load teacher vectors with specified noise
+        parent_vectors, child_deltas, projectors = load_teacher_vectors(config, noise_deg=noise_deg)
+
+        # Create teacher-initialized H-SAE
+        model = create_teacher_hsae(
+            config, activations.shape[1], parent_vectors, child_deltas, projectors, geometry
+        )
+
+        # Train teacher-initialized H-SAE
+        results = train_teacher_hsae_with_sanity_checks(model, activations, config, exp_dir, geometry)
+        all_results[f"noise_{noise_deg}deg"] = results
+        
+        # Save per-run metrics
+        noise_metrics_file = exp_dir / f"metrics_noise_{noise_deg}deg.json"
+        with open(noise_metrics_file, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        logger.info(f"💾 Saved metrics for {noise_deg}° noise to {noise_metrics_file}")
+
+    # Use results from 0° noise (clean teacher) for comparison
+    results = all_results.get("noise_0deg", list(all_results.values())[0])
 
     # Compare with baseline
     comparison = compare_with_baseline(results, config)

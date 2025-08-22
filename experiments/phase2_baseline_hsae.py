@@ -212,14 +212,29 @@ def _train_baseline_hsae_single_attempt(model, activations, config, exp_dir, att
             }
         )
 
-    # Training with sanity checking
+    # Training with sanity checking - support schedule-only freeze control
     total_steps = config["training"]["baseline"]["total_steps"]
-    history = trainer.train_baseline(
-        train_loader=train_loader, 
-        val_loader=val_loader, 
-        total_steps=total_steps,
-        sanity_checker=sanity_checker
-    )
+    
+    # Check if we should use schedule-only freeze (same freeze→adapt schedule but with random init)
+    if config["training"]["baseline"].get("schedule_only_freeze", False):
+        logger.info("🔄 Running baseline with schedule-only freeze control (random init + freeze→adapt)")
+        # Use the same two-stage freeze→adapt schedule as teacher-init but with random init and no causal-ortho
+        stabilize_steps = config["training"]["teacher_init"]["stage_A"]["steps"]
+        adapt_steps = config["training"]["teacher_init"]["stage_B"]["steps"]
+        
+        history = trainer.train_teacher_init(
+            train_loader, val_loader,
+            stabilize_steps=stabilize_steps,
+            adapt_steps=adapt_steps,
+            sanity_checker=sanity_checker,
+        )
+    else:
+        history = trainer.train_baseline(
+            train_loader=train_loader, 
+            val_loader=val_loader, 
+            total_steps=total_steps,
+            sanity_checker=sanity_checker
+        )
 
     # Final evaluation
     logger.info("Running final evaluation")
@@ -249,7 +264,7 @@ def _train_baseline_hsae_single_attempt(model, activations, config, exp_dir, att
         logger.info(f"  Parent sparsity: {final_metrics.get('parent_sparsity', 0.0):.4f}")
         logger.info(f"  Child sparsity: {final_metrics.get('child_sparsity', 0.0):.4f}")
         
-        # Compute detailed EV breakdown (standard only for baseline)
+        # Compute detailed EV breakdown (standard + causal + logit for comprehensive check)
         logger.info("🔍 Computing detailed EV breakdown:")
         model.eval()
         with torch.no_grad():
@@ -259,12 +274,45 @@ def _train_baseline_hsae_single_attempt(model, activations, config, exp_dir, att
             val_sample = val_sample.to(device)
             x_hat, _, _ = model(val_sample)
             
-            # Use dual EV computation (geometry=None for baseline)
-            from polytope_hsae.metrics import compute_dual_explained_variance
+            # Standard EV
+            from polytope_hsae.metrics import compute_dual_explained_variance, compute_logit_ev
             ev_results = compute_dual_explained_variance(
                 val_sample, x_hat, geometry=None, print_components=True
             )
             logger.info(f"✅ Baseline H-SAE Standard EV: {ev_results['standard_ev']:.6f}")
+            
+            # For fair comparison, also compute causal-EV by creating geometry just for eval
+            try:
+                from polytope_hsae.geometry import CausalGeometry
+                # Load unembedding matrix for causal geometry construction
+                import transformers
+                model_name = config["model"]["name"]
+                hf_model = transformers.AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype=torch.bfloat16, device_map=device
+                )
+                unembedding_matrix = hf_model.lm_head.weight.detach()
+                
+                # Create geometry for causal-EV evaluation only
+                eval_geometry = CausalGeometry.from_unembedding(
+                    unembedding_matrix, shrinkage=config["geometry"].get("shrinkage", 0.05)
+                )
+                eval_geometry.to(str(device))
+                
+                causal_ev_results = compute_dual_explained_variance(
+                    val_sample, x_hat, geometry=eval_geometry, print_components=False
+                )
+                logger.info(f"✅ Baseline H-SAE Causal EV: {causal_ev_results['causal_ev']:.6f}")
+                
+                # Logit-EV for comprehensive check
+                logit_ev = compute_logit_ev(val_sample, x_hat, unembedding_matrix)
+                logger.info(f"✅ Baseline H-SAE Logit EV: {logit_ev:.6f}")
+                
+                # Clean up
+                del hf_model
+                
+            except Exception as e:
+                logger.warning(f"Could not compute causal/logit EV: {e}")
+                logger.info("Continuing with standard EV only")
         
         log_metrics_summary(final_metrics, logger)
     except Exception as e:

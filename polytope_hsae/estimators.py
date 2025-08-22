@@ -250,14 +250,16 @@ class ConceptVectorEstimator:
         parent_vectors: Dict[str, torch.Tensor],
         child_deltas: Dict[str, Dict[str, torch.Tensor]],
         subspace_dim: int = 96,
+        energy_threshold: float = 0.85,
     ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Estimate down/up projectors for child subspaces using SVD.
+        Estimate down/up projectors for child subspaces using SVD with energy-based dimension selection.
 
         Args:
             parent_vectors: Parent concept vectors
             child_deltas: Child delta vectors
-            subspace_dim: Dimension of child subspace
+            subspace_dim: Global maximum dimension of child subspace
+            energy_threshold: Threshold for cumulative energy (default 0.85 for 85%)
 
         Returns:
             Dict mapping parent_id -> (down_projector, up_projector)
@@ -277,8 +279,14 @@ class ConceptVectorEstimator:
             U, S, Vh = torch.linalg.svd(delta_matrix, full_matrices=False)
             V = Vh.t()
 
-            # Take top subspace_dim components
-            k = min(subspace_dim, delta_matrix.shape[0], delta_matrix.shape[1])
+            # Energy-based dimension selection: pick k = min(global_subspace_dim, k_85%)
+            # where k_85% is the smallest rank reaching 85% energy per parent
+            cumulative_energy = torch.cumsum(S, dim=0) / S.sum()
+            k_energy = (cumulative_energy <= energy_threshold).sum().item() + 1
+            k = min(subspace_dim, k_energy, V.shape[1])
+            
+            logger.info(f"Parent {parent_id}: selected k={k} dims (energy-based: {k_energy}, global cap: {subspace_dim})")
+            
             V_k = V[:, :k]  # [d, k]
 
             # Down projector: residual -> subspace

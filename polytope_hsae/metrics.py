@@ -36,6 +36,31 @@ def compute_explained_variance(x: torch.Tensor, x_hat: torch.Tensor) -> float:
     return ev.item()
 
 
+def compute_logit_ev(x: torch.Tensor, x_hat: torch.Tensor, unembedding: torch.Tensor) -> float:
+    """
+    Compute explained variance in logit space: EV_logit = 1 - ||X - X_hat||²_F / ||X - X_mean||²_F
+    where X = x @ U^T (logits) and X_hat = x_hat @ U^T.
+
+    Args:
+        x: Original activations [batch_size, dim]
+        x_hat: Reconstructed activations [batch_size, dim] 
+        unembedding: Unembedding matrix [vocab_size, dim]
+
+    Returns:
+        Logit-space explained variance (higher is better)
+    """
+    # Project to logit space
+    X = x @ unembedding.T  # [batch_size, vocab_size]
+    X_hat = x_hat @ unembedding.T  # [batch_size, vocab_size]
+    X_mean = X.mean(dim=0, keepdim=True)
+
+    numerator = torch.sum((X - X_hat) ** 2)
+    denominator = torch.sum((X - X_mean) ** 2)
+
+    ev_logit = 1.0 - (numerator / (denominator + 1e-8))
+    return ev_logit.item()
+
+
 def compute_dual_explained_variance(
     x: torch.Tensor, 
     x_hat: torch.Tensor, 
