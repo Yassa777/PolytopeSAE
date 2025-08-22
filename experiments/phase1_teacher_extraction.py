@@ -152,6 +152,10 @@ def extract_teacher_vectors(config, hierarchies, activations, exp_dir, unembeddi
     geometry = CausalGeometry.from_unembedding(
         unembedding_matrix, shrinkage=config["geometry"]["shrinkage"]
     )
+    # Save precomputed geometry for later phases
+    geometry_file = exp_dir / "geometry.pt"
+    geometry.save(geometry_file)
+    logger.info(f"Saved geometry to {geometry_file}")
 
     # Create LDA estimator
     lda_estimator = LDAEstimator(

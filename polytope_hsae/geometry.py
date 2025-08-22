@@ -141,7 +141,36 @@ class CausalGeometry:
         
         geometry.Sigma = Sigma_diag
         geometry.W = W_diag
-        
+
+        return geometry
+
+    def save(self, path: str):
+        """Save geometry tensors to disk."""
+        data = {
+            "unembedding_matrix": self.U.cpu(),
+            "whitening_matrix": self.W.cpu(),
+            "Sigma": self.Sigma.cpu(),
+            "whitening": self.whitening,
+            "shrinkage": self.shrinkage,
+            "cov_device": self.cov_device,
+        }
+        torch.save(data, path)
+
+    @classmethod
+    def load(cls, path: str, map_location=None):
+        """Load geometry from disk without recomputing whitening."""
+        data = torch.load(path, map_location=map_location or "cpu")
+        geometry = cls.__new__(cls)
+        geometry.U = data["unembedding_matrix"]
+        geometry.W = data["whitening_matrix"]
+        geometry.Sigma = data.get("Sigma")
+        geometry.whitening = data.get("whitening", "unembedding_rows")
+        geometry.shrinkage = data.get("shrinkage", 0.05)
+        geometry.cov_device = data.get("cov_device", "cpu")
+        geometry.device = geometry.U.device
+        geometry.dtype = torch.float32
+        geometry.cache_dir = None
+        geometry.residual_acts = None
         return geometry
 
     def _compute_whitening_matrix(self) -> Tuple[torch.Tensor, torch.Tensor]:
