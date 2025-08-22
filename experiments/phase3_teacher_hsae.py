@@ -21,18 +21,28 @@ import torch
 import wandb
 import yaml
 from tqdm import tqdm
+from torch.utils.data import Subset
 
-from polytope_hsae.activations import ActivationCapture
+from polytope_hsae.activations import HDF5ActivationsDataset
 from polytope_hsae.estimators import ConceptVectorEstimator
 from polytope_hsae.geometry import CausalGeometry
-from polytope_hsae.metrics import (compute_comprehensive_metrics,
-                                   compute_explained_variance,
-                                   log_metrics_summary)
+from polytope_hsae.metrics import (
+    compute_comprehensive_metrics,
+    compute_explained_variance,
+    log_metrics_summary,
+)
 # Project imports
-from polytope_hsae.models import (HierarchicalSAE, HSAEConfig,
-                                  create_teacher_initialized_hsae)
+from polytope_hsae.models import (
+    HierarchicalSAE,
+    HSAEConfig,
+    create_teacher_initialized_hsae,
+)
 from polytope_hsae.sanity_checker import TrainingSanityChecker
-from polytope_hsae.training import HSAETrainer, TrainingRestartException, create_data_loader
+from polytope_hsae.training import (
+    HSAETrainer,
+    TrainingRestartException,
+    create_data_loader,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -116,7 +126,7 @@ def load_teacher_vectors(config, noise_deg=0.0):
 
 
 def load_activations(config, exp_dir):
-    """Load activations from Phase 1."""
+    """Create a streaming dataset of Phase 1 activations."""
     activations_file = (
         Path(config["logging"]["save_dir"])
         / config["logging"]["phase_1_log"]
@@ -126,20 +136,15 @@ def load_activations(config, exp_dir):
     if not activations_file.exists():
         raise FileNotFoundError(f"Activations not found: {activations_file}")
 
-    logger.info(f"Loading activations from {activations_file}")
+    logger.info(f"Using activation dataset {activations_file}")
 
-    activations = ActivationCapture.load_hierarchical_activations(str(activations_file))
+    dataset = HDF5ActivationsDataset(
+        str(activations_file),
+        unit_norm=config.get("data", {}).get("unit_norm", False),
+    )
+    logger.info(f"Activation dataset provides {len(dataset)} samples")
 
-    # Convert to training format
-    all_activations = []
-    for concept_id, pos_neg_dict in activations.items():
-        all_activations.append(pos_neg_dict["pos"])
-        all_activations.append(pos_neg_dict["neg"])
-
-    combined_activations = torch.cat(all_activations, dim=0)
-    logger.info(f"Loaded {combined_activations.shape[0]} activation samples")
-
-    return combined_activations
+    return dataset
 
 
 def create_teacher_hsae(config, input_dim: int, parent_vectors, child_deltas, projectors, geometry):
@@ -232,7 +237,7 @@ def load_geometry(config):
     return geometry
 
 
-def train_teacher_hsae_with_sanity_checks(model, activations, config, exp_dir, geometry):
+def train_teacher_hsae_with_sanity_checks(model, dataset, config, exp_dir, geometry):
     """Train teacher-initialized H-SAE with automated sanity checking."""
     max_attempts = 3
     attempt = 0
@@ -242,7 +247,7 @@ def train_teacher_hsae_with_sanity_checks(model, activations, config, exp_dir, g
         logger.info(f"🚀 Starting teacher-initialized H-SAE training (attempt {attempt}/{max_attempts})")
         
         try:
-            results = _train_teacher_hsae_single_attempt(model, activations, config, exp_dir, geometry, attempt)
+            results = _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry, attempt)
             logger.info("✅ Training completed successfully!")
             return results
             
@@ -256,7 +261,7 @@ def train_teacher_hsae_with_sanity_checks(model, activations, config, exp_dir, g
             logger.info("🔧 Recreating model with updated configuration...")
             parent_vectors, child_deltas, projectors = load_teacher_vectors(config)
             model = create_teacher_hsae(
-                config, activations.shape[1], parent_vectors, child_deltas, projectors, geometry
+                config, dataset.feature_dim, parent_vectors, child_deltas, projectors, geometry
             )
             continue
             
@@ -267,7 +272,7 @@ def train_teacher_hsae_with_sanity_checks(model, activations, config, exp_dir, g
     raise RuntimeError("Training failed after all attempts")
 
 
-def _train_teacher_hsae_single_attempt(model, activations, config, exp_dir, geometry, attempt_num):
+def _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry, attempt_num):
     """Single training attempt with sanity checking."""
     logger.info(f"Starting teacher-initialized H-SAE training (attempt {attempt_num})")
 
@@ -275,30 +280,26 @@ def _train_teacher_hsae_single_attempt(model, activations, config, exp_dir, geom
     device = torch.device(config["run"]["device"])
     model = model.to(device)
 
-    # Unit normalize if specified
-    if config.get("data", {}).get("unit_norm", False):
-        activations = torch.nn.functional.normalize(activations, dim=-1)
-
     # Split data (70/15/15 as per config spec)
-    n_samples = activations.shape[0]
+    n_samples = len(dataset)
     n_train = int(0.70 * n_samples)
     n_val = int(0.15 * n_samples)
     n_test = n_samples - n_train - n_val
 
-    train_activations = activations[:n_train]
-    val_activations = activations[n_train:n_train + n_val]
-    test_activations = activations[n_train + n_val:]
-    
+    train_ds = Subset(dataset, range(n_train))
+    val_ds = Subset(dataset, range(n_train, n_train + n_val))
+    test_ds = Subset(dataset, range(n_train + n_val, n_samples))
+
     logger.info(f"Data split: train={n_train}, val={n_val}, test={n_test} samples")
 
     train_loader = create_data_loader(
-        train_activations,
+        train_ds,
         batch_size=config["training"]["batch_size_acts"],
         device=config["run"]["device"],
         shuffle=True,
     )
     val_loader = create_data_loader(
-        val_activations,
+        val_ds,
         batch_size=config["training"]["batch_size_acts"],
         device=config["run"]["device"],
         shuffle=False,
@@ -620,7 +621,7 @@ def main():
     geometry = load_geometry(config)
 
     # Load activations from Phase 1
-    activations = load_activations(config, exp_dir)
+    activation_ds = load_activations(config, exp_dir)
 
     # Get noise levels for teacher ablation
     noise_levels = config["training"]["teacher_init"].get("teacher_noise_deg", [0])
@@ -638,11 +639,13 @@ def main():
 
         # Create teacher-initialized H-SAE
         model = create_teacher_hsae(
-            config, activations.shape[1], parent_vectors, child_deltas, projectors, geometry
+            config, activation_ds.feature_dim, parent_vectors, child_deltas, projectors, geometry
         )
 
         # Train teacher-initialized H-SAE
-        results = train_teacher_hsae_with_sanity_checks(model, activations, config, exp_dir, geometry)
+        results = train_teacher_hsae_with_sanity_checks(
+            model, activation_ds, config, exp_dir, geometry
+        )
         all_results[f"noise_{noise_deg}deg"] = results
         
         # Save per-run metrics

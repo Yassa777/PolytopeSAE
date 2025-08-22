@@ -10,6 +10,7 @@ import multiprocessing as mp
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import bisect
 
 import contextlib
 import h5py
@@ -458,6 +459,88 @@ class ActivationCapture:
     # def load_hierarchical_activations(self, filepath: str) -> Dict[str, Dict[str, torch.Tensor]]:
     #     """Load hierarchical activations from HDF5 file."""
     #     return ActivationCapture.load_hierarchical_activations(filepath)
+
+
+class HDF5ActivationsDataset(torch.utils.data.Dataset):
+    """Lazily stream activations from an HDF5 file.
+
+    This dataset treats the Phase 1 ``activations.h5`` file as a flat
+    collection of activation vectors.  Each concept contributes both its
+    positive and negative examples and samples are accessed on demand using
+    ``h5py``.  No activation tensors are fully materialized in memory which
+    keeps the footprint small even for very large corpora.
+
+    Parameters
+    ----------
+    h5_path: str
+        Path to the ``activations.h5`` file produced in Phase 1.
+    unit_norm: bool, optional
+        If ``True`` each activation vector is L2 normalised when loaded.
+    """
+
+    def __init__(self, h5_path: str, *, unit_norm: bool = False) -> None:
+        self.h5_path = str(h5_path)
+        self.unit_norm = unit_norm
+        self._file: Optional[h5py.File] = None
+
+        # Build index mapping
+        self._datasets: List[Tuple[str, str]] = []  # (concept_id, pos/neg)
+        self._cumulative_lengths: List[int] = []
+
+        total = 0
+        with h5py.File(self.h5_path, "r") as f:
+            feature_dim = None
+            for concept_id in f.keys():
+                for posneg in ("pos", "neg"):
+                    ds = f[concept_id][posneg]
+                    length = ds.shape[0]
+                    if feature_dim is None:
+                        feature_dim = ds.shape[1]
+                    total += length
+                    self._datasets.append((concept_id, posneg))
+                    self._cumulative_lengths.append(total)
+
+        if feature_dim is None:
+            raise ValueError("No activations found in HDF5 file")
+
+        self.feature_dim = int(feature_dim)
+        self._length = total
+
+    def __len__(self) -> int:
+        return self._length
+
+    # Lazy opening of the HDF5 file per worker
+    def _ensure_file(self) -> None:
+        if self._file is None:
+            self._file = h5py.File(self.h5_path, "r")
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        if idx < 0 or idx >= self._length:
+            raise IndexError(idx)
+
+        self._ensure_file()
+
+        # Locate dataset using binary search over cumulative lengths
+        ds_idx = bisect.bisect_right(self._cumulative_lengths, idx)
+        start = 0 if ds_idx == 0 else self._cumulative_lengths[ds_idx - 1]
+        offset = idx - start
+        concept_id, posneg = self._datasets[ds_idx]
+        arr = self._file[concept_id][posneg][offset]
+        tensor = torch.from_numpy(arr)
+        if self.unit_norm:
+            tensor = torch.nn.functional.normalize(tensor, dim=-1)
+        return tensor
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def create_activation_shards(

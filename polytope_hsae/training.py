@@ -618,19 +618,30 @@ class H5ActivationDataset(Dataset):
 
 
 def create_data_loader(
-    activation_tensors: Union[List[torch.Tensor], torch.Tensor],
+    activation_tensors: Union[List[torch.Tensor], torch.Tensor, Dataset],
     batch_size: int,
     device: str,
     shuffle: bool = True,
     num_workers: Optional[int] = None,
     pin_memory: Optional[bool] = None,
 ) -> DataLoader:
-    X = (
-        activation_tensors
-        if isinstance(activation_tensors, torch.Tensor)
-        else torch.cat(activation_tensors, dim=0)
-    )
-    ds = TensorDataset(X)
+    """Create a ``DataLoader`` for activation tensors or datasets.
+
+    The original implementation expected in-memory tensors.  This version also
+    accepts any :class:`~torch.utils.data.Dataset` (for example one that
+    streams activations from disk) and will construct a loader directly from it
+    without concatenating tensors.
+    """
+
+    if isinstance(activation_tensors, Dataset):
+        ds = activation_tensors
+    else:
+        X = (
+            activation_tensors
+            if isinstance(activation_tensors, torch.Tensor)
+            else torch.cat(activation_tensors, dim=0)
+        )
+        ds = TensorDataset(X)
 
     is_cuda = str(device).startswith("cuda")
     if num_workers is None:
