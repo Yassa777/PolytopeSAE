@@ -13,6 +13,7 @@ Estimated runtime: 12-14 hours
 import argparse
 import json
 import logging
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -73,8 +74,8 @@ def add_angular_noise(vec, deg):
     r = torch.randn_like(v)
     r = r - (r @ v) * v  # Make orthogonal to v
     r = r / (r.norm() + 1e-8)
-    theta = deg * torch.pi / 180
-    return (torch.cos(theta) * v + torch.sin(theta) * r) * vec.norm()
+    theta = deg * math.pi / 180
+    return (math.cos(theta) * v + math.sin(theta) * r) * vec.norm()
 
 
 def load_teacher_vectors(config, noise_deg=0.0):

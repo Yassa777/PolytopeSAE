@@ -464,10 +464,21 @@ def compute_comprehensive_metrics(
     final_metrics = {}
     if all_metrics:
         for key in all_metrics[0].keys():
-            values = [m[key] for m in all_metrics if key in m and not np.isnan(m[key])]
-            if values:
-                final_metrics[key] = np.mean(values)
-                final_metrics[f"{key}_std"] = np.std(values)
+            # Convert values to float to handle bools and check for NaN
+            raw_values = [m[key] for m in all_metrics if key in m]
+            float_values = []
+            for v in raw_values:
+                try:
+                    fv = float(v)
+                    if not np.isnan(fv):
+                        float_values.append(fv)
+                except (TypeError, ValueError):
+                    # Skip values that can't be converted to float
+                    continue
+            
+            if float_values:
+                final_metrics[key] = np.mean(float_values)
+                final_metrics[f"{key}_std"] = np.std(float_values)
 
     return final_metrics
 

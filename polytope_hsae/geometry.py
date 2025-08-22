@@ -217,14 +217,14 @@ class CausalGeometry:
         return x @ W.T
 
     def unwhiten(self, x_whitened: torch.Tensor) -> torch.Tensor:
-        """Apply inverse whitening transformation: x = x̃W^{-1} = x̃W^T."""
+        """Apply inverse whitening transformation: x = x̃W^{-1}."""
         if x_whitened.ndim not in (1, 2):
             raise ValueError("unwhiten expects a 1D or 2D tensor")
-        W = self.W.to(
-            x_whitened.device,
-            dtype=x_whitened.dtype if x_whitened.dtype.is_floating_point else torch.float32,
-        )
-        return x_whitened @ W
+        # whiten(x) = x @ W^T  ⇒  unwhiten(x̃) solves W^T · x = x̃
+        W = self.W.to(x_whitened.device, dtype=torch.float32)
+        xw = x_whitened.to(torch.float32)
+        x_orig = torch.linalg.solve(W.T, xw.T).T   # numerically safer than explicit inverse
+        return x_orig.to(x_whitened.dtype)
 
     def causal_inner_product(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
