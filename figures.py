@@ -577,15 +577,30 @@ def fig9_geometry_performance_map(paths: Paths, teacher: dict, model_name: str, 
             return
     elif agg is not None and not agg.empty:
         # Aggregate fallback: use overall median angle on x, and overall Δ metrics on y/size
-        overall_angle = float(per_parent_angle["angle_deg"].median())
+        try:
+            overall_angle = float(per_parent_angle["angle_deg"].median())
+            if np.isnan(overall_angle):
+                print("[fig9] Median angle is NaN — skipping")
+                return
+        except Exception:
+            print("[fig9] Failed to compute overall angle — skipping")
+            return
+            
         try:
             t = agg[agg["run"]=="teacher-init"].iloc[0]
             b = agg[agg["run"]=="baseline"].iloc[0]
             delta_leak = float(t["leakage"] - b["leakage"])
             delta_pur  = float(t["purity"] - b["purity"])
+            
+            # Validate the computed values
+            if np.isnan(delta_leak) or np.isnan(delta_pur):
+                print("[fig9] Delta metrics contain NaN — skipping")
+                return
+                
         except Exception:
             print("[fig9] aggregate metrics incomplete — skipping")
             return
+            
         plt.figure(figsize=(4.6, 3.8))
         size = 800 * max(abs(delta_pur), 0.05)
         plt.scatter([overall_angle], [delta_leak], s=size, alpha=0.8)
