@@ -531,9 +531,17 @@ def fig9_geometry_performance_map(paths: Paths, teacher: dict, model_name: str, 
     elif teacher and use_hf:
         print("[fig9] angles_by_pair.csv not found — recomputing angles per parent via HF model ...")
         df_pairs = recompute_angles_from_teacher(teacher, model_name, shrinkage)
+        if df_pairs is None or df_pairs.empty:
+            print("[fig9] Failed to recompute angles — skipping")
+            return
         per_parent_angle = df_pairs.groupby("parent_id")["angle_deg"].median().reset_index()
     else:
         print("[fig9] Missing angles and HF disabled — skipping")
+        return
+    
+    # Check if we have any angle data
+    if per_parent_angle.empty:
+        print("[fig9] No angle data available — skipping")
         return
 
     # 2) Per-parent H‑SAE metrics (preferred), else aggregates
@@ -546,21 +554,27 @@ def fig9_geometry_performance_map(paths: Paths, teacher: dict, model_name: str, 
         piv = piv.reset_index()
         # Merge with angles
         df = per_parent_angle.merge(piv, on="parent_id", how="inner")
-        # Deltas (teacher - baseline) — lower leakage is better, higher purity better
-        df["delta_leakage"] = df["leakage_teacher-init"] - df["leakage_baseline"]
-        df["delta_purity"]  = df["purity_teacher-init"]  - df["purity_baseline"]
+        
+        # Check if we have any data after merge
+        if df.empty:
+            print("[fig9] No matching parent data after merge — falling back to aggregate plot")
+        else:
+            # Deltas (teacher - baseline) — lower leakage is better, higher purity better
+            df["delta_leakage"] = df["leakage_teacher-init"] - df["leakage_baseline"]
+            df["delta_purity"]  = df["purity_teacher-init"]  - df["purity_baseline"]
 
-        # Scatter
-        plt.figure(figsize=(5.4, 4.2))
-        sizes = 300 * np.clip(np.abs(df["delta_purity"].to_numpy()), 0.05, 0.30)  # bubble size ~ |Δ purity|
-        plt.scatter(df["angle_deg"], df["delta_leakage"], s=sizes, alpha=0.75)
-        # Refs
-        plt.axhline(0.0, linewidth=1, linestyle="--")
-        plt.xlabel("Median causal angle per parent (degrees)")
-        plt.ylabel("Δ leakage (teacher − baseline)  ↓ better if negative")
-        plt.title("Fig. 9 — Geometry→Performance Map\nBubble size ∝ |Δ purity|")
-        _savefig(out)
-        print(f"[fig9] wrote {out}")
+            # Scatter
+            plt.figure(figsize=(5.4, 4.2))
+            sizes = 300 * np.clip(np.abs(df["delta_purity"].to_numpy()), 0.05, 0.30)  # bubble size ~ |Δ purity|
+            plt.scatter(df["angle_deg"], df["delta_leakage"], s=sizes, alpha=0.75)
+            # Refs
+            plt.axhline(0.0, linewidth=1, linestyle="--")
+            plt.xlabel("Median causal angle per parent (degrees)")
+            plt.ylabel("Δ leakage (teacher − baseline)  ↓ better if negative")
+            plt.title("Fig. 9 — Geometry→Performance Map\nBubble size ∝ |Δ purity|")
+            _savefig(out)
+            print(f"[fig9] wrote {out}")
+            return
     elif agg is not None and not agg.empty:
         # Aggregate fallback: use overall median angle on x, and overall Δ metrics on y/size
         overall_angle = float(per_parent_angle["angle_deg"].median())
