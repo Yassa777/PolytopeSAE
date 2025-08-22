@@ -302,8 +302,8 @@ def compute_split_absorb_rates(
     batch_size, n_parents, n_children = child_codes.shape
 
     # Usage statistics
-    child_usage = torch.mean(child_codes > 0, dim=0)  # [n_parents, n_children]
-    parent_usage = torch.mean(parent_codes > 0, dim=0)  # [n_parents]
+    child_usage = torch.mean((child_codes > 0).float(), dim=0)  # [n_parents, n_children]
+    parent_usage = torch.mean((parent_codes > 0).float(), dim=0)  # [n_parents]
 
     split_latents = 0  # Child latents that split (multiple children used)
     absorb_latents = 0  # Child latents that absorb (become parent-like)
