@@ -34,6 +34,7 @@ geometry:
     lda_shrinkage: 0.10
     min_vocab_count: 50
     class_balance: true
+    energy_threshold: 0.85  # SVD energy threshold for projector dimensions
 
 teacher:
   parent_vectors: "from_final_layer"

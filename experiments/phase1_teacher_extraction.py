@@ -163,8 +163,8 @@ def extract_teacher_vectors(config, hierarchies, activations, exp_dir):
 
     logger.info(f"Unembedding matrix shape: {unembedding_matrix.shape}")
 
-    # Create causal geometry
-    geometry = CausalGeometry(
+    # Create causal geometry (standard approach)
+    geometry = CausalGeometry.from_unembedding(
         unembedding_matrix, shrinkage=config["geometry"]["shrinkage"]
     )
 
@@ -204,9 +204,11 @@ def extract_teacher_vectors(config, hierarchies, activations, exp_dir):
     # Estimate child deltas
     child_deltas = estimator.estimate_child_deltas(parent_vectors, child_activations)
 
-    # Estimate projectors for H-SAE initialization
+    # Estimate projectors for H-SAE initialization with energy-based dimension selection
     projectors = estimator.estimate_child_subspace_projectors(
-        parent_vectors, child_deltas, config["hsae"]["subspace_dim"]
+        parent_vectors, child_deltas, 
+        subspace_dim=config["hsae"]["subspace_dim"],
+        energy_threshold=config["geometry"]["estimator"].get("energy_threshold", 0.85)
     )
 
     # Save results
@@ -235,11 +237,88 @@ def extract_teacher_vectors(config, hierarchies, activations, exp_dir):
 
 
 def validate_geometry(config, parent_vectors, child_deltas, geometry, exp_dir):
-    """Validate geometric claims."""
-    logger.info("Validating geometric claims")
+    """Validate geometric claims with metric triangulation."""
+    logger.info("Validating geometric claims with metric triangulation")
 
     # Create validator
     validator = GeometryValidator(geometry)
+    
+    # Metric triangulation: test multiple geometry sources
+    geometry_sources = ["from_unembedding"]  # Always include the main one
+    triangulation_results = {}
+    
+    # Try alternative geometry sources if enabled
+    try:
+        # Load model for alternative geometries
+        model = AutoModelForCausalLM.from_pretrained(config["model"]["name"])
+        tokenizer = AutoTokenizer.from_pretrained(config["model"]["name"])
+        
+        # Create dummy prompts for geometry validation
+        test_prompts = [
+            "The capital of France is Paris.",
+            "Water boils at 100 degrees Celsius.",
+            "The sun is a star in our solar system.",
+            "Dogs are domestic animals.",
+            "Mathematics is the study of numbers."
+        ]
+        
+        # Test from_logit_cov geometry
+        try:
+            from polytope_hsae.geometry import CausalGeometry
+            logit_geometry = CausalGeometry.from_logit_cov(
+                model, tokenizer, test_prompts, 
+                shrinkage=config["geometry"]["shrinkage"]
+            )
+            geometry_sources.append("from_logit_cov")
+            
+            # Validate with logit geometry
+            logit_validator = GeometryValidator(logit_geometry)
+            logit_ortho = logit_validator.test_hierarchical_orthogonality(
+                parent_vectors, child_deltas,
+                threshold_degrees=config["eval"]["targets"]["median_angle_deg"]
+            )
+            triangulation_results["from_logit_cov"] = {
+                "median_angle_deg": logit_ortho["median_angle_deg"],
+                "fraction_above_80deg": logit_ortho["fraction_above_threshold"],
+                "passes_threshold": logit_ortho["median_angle_deg"] >= config["eval"]["targets"]["median_angle_deg"]
+            }
+            logger.info(f"Logit-cov geometry: median angle = {logit_ortho['median_angle_deg']:.1f}°")
+            
+        except Exception as e:
+            logger.warning(f"Could not test logit-cov geometry: {e}")
+        
+        # Test fisher_like geometry
+        try:
+            fisher_geometry = CausalGeometry.fisher_like(
+                model, tokenizer, test_prompts,
+                shrinkage=config["geometry"]["shrinkage"]
+            )
+            geometry_sources.append("fisher_like")
+            
+            # Validate with Fisher geometry
+            fisher_validator = GeometryValidator(fisher_geometry)
+            fisher_ortho = fisher_validator.test_hierarchical_orthogonality(
+                parent_vectors, child_deltas,
+                threshold_degrees=config["eval"]["targets"]["median_angle_deg"]
+            )
+            triangulation_results["fisher_like"] = {
+                "median_angle_deg": fisher_ortho["median_angle_deg"],
+                "fraction_above_80deg": fisher_ortho["fraction_above_threshold"],
+                "passes_threshold": fisher_ortho["median_angle_deg"] >= config["eval"]["targets"]["median_angle_deg"]
+            }
+            logger.info(f"Fisher-like geometry: median angle = {fisher_ortho['median_angle_deg']:.1f}°")
+            
+        except Exception as e:
+            logger.warning(f"Could not test Fisher-like geometry: {e}")
+            
+        # Clean up
+        del model
+        if 'tokenizer' in locals():
+            del tokenizer
+            
+    except Exception as e:
+        logger.warning(f"Could not load model for alternative geometries: {e}")
+        logger.info("Continuing with standard unembedding geometry only")
 
     # Test hierarchical orthogonality
     orthogonality_results = validator.test_hierarchical_orthogonality(
@@ -298,6 +377,20 @@ def validate_geometry(config, parent_vectors, child_deltas, geometry, exp_dir):
         parent_vectors, child_deltas, geometry
     )
 
+    # Add standard geometry results to triangulation
+    triangulation_results["from_unembedding"] = {
+        "median_angle_deg": orthogonality_results["median_angle_deg"],
+        "fraction_above_80deg": orthogonality_results["fraction_above_threshold"],
+        "passes_threshold": orthogonality_results["median_angle_deg"] >= config["eval"]["targets"]["median_angle_deg"]
+    }
+    
+    # Compute triangulation consensus: pass if ≥2/3 geometries agree
+    passing_geometries = sum(1 for result in triangulation_results.values() if result["passes_threshold"])
+    triangulation_passes = passing_geometries >= max(2, len(triangulation_results) * 2 // 3)
+    
+    logger.info(f"Metric triangulation: {passing_geometries}/{len(triangulation_results)} geometries pass")
+    logger.info(f"Triangulation consensus: {'PASS' if triangulation_passes else 'FAIL'}")
+
     # Compile results
     validation_results = {
         "orthogonality_test": {
@@ -313,12 +406,18 @@ def validate_geometry(config, parent_vectors, child_deltas, geometry, exp_dir):
             "q25_angle_deg": angle_stats["q25_angle_deg"].item(),
             "q75_angle_deg": angle_stats["q75_angle_deg"].item(),
         },
+        "metric_triangulation": {
+            "geometry_sources": geometry_sources,
+            "results_per_geometry": triangulation_results,
+            "passing_geometries": passing_geometries,
+            "total_geometries": len(triangulation_results),
+            "triangulation_passes": triangulation_passes
+        },
         "orthogonality_validation": orthogonality_validation,
         "control_experiments": control_results,
         "passes_validation": (
-            orthogonality_results["median_angle_deg"]
-            >= config["eval"]["targets"]["median_angle_deg"]
-            and orthogonality_results["fraction_above_threshold"] >= 0.5
+            triangulation_passes and
+            orthogonality_results["fraction_above_threshold"] >= 0.5
         ),
     }
 
