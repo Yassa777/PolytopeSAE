@@ -314,8 +314,15 @@ class HierarchicalSAE(nn.Module):
                     if i >= self.config.n_parents:
                         break
                     sub = self.subspaces[i]
-                    sub.down_projector.weight.copy_(down_proj)
-                    sub.up_projector.weight.copy_(up_proj)
+                    
+                    # Check dimensions before copying
+                    if (down_proj.shape == sub.down_projector.weight.shape and 
+                        up_proj.shape == sub.up_projector.weight.shape):
+                        sub.down_projector.weight.copy_(down_proj)
+                        sub.up_projector.weight.copy_(up_proj)
+                    else:
+                        logger.warning(f"Projector {i} shape mismatch: expected down={sub.down_projector.weight.shape}, got {down_proj.shape}; expected up={sub.up_projector.weight.shape}, got {up_proj.shape}")
+                        logger.warning(f"Skipping projector seeding for parent {i}, keeping random initialization")
 
             for i in range(self.config.n_parents):
                 sub = self.subspaces[i]
