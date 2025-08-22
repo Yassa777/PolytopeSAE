@@ -8,7 +8,7 @@ run:
   notes: "V2 focused experiment: teacher extraction + baseline vs teacher-init H-SAE comparison"
 
 model:
-  name: google/gemma-2-2b  # Gemma 2.0 2B parameters
+  name: EleutherAI/pythia-410m  # Pythia 410M parameters (much smaller, faster)
   dtype: bf16
   activation_hook: final_residual_pre_unembed
   layers_probe: ["last"]  # Single late layer only
@@ -43,10 +43,11 @@ teacher:
 
 hsae:
   # IDENTICAL architecture for Phase 2 & 3 comparison (following geometric story K=1)
-  m_top: 32                  # Enough parent choices for variety across tokens
+  # Adjusted for Pythia-410M (hidden_size=1024)
+  m_top: 16                  # Reduced for smaller model
   topk_parent: 1             # K=1 aligns with geometry & ablations
-  subspace_dim: 64           # 65 active dims/token (1 parent + 1*64 child dims)
-  m_low: 8                   # Enough child choices per parent
+  subspace_dim: 32           # Reduced for smaller model (33 active dims/token)
+  m_low: 8                   # Keep same child choices per parent
   topk_child: 1              # K=1 for geometric consistency
   projectors_init: "svd_from_teacher"
   l1_parent: 2.0e-4          # Reduced, will add warmup

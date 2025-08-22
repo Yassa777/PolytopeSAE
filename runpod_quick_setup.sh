@@ -79,27 +79,25 @@ export HF_HOME=~/.cache/huggingface
 echo 'export HF_HOME=~/.cache/huggingface' >> ~/.bashrc
 log_success "HuggingFace cache directory configured"
 
-# Step 5: Pre-download Gemma model
-log_info "Step 5: Pre-downloading Gemma-2B model (this may take a few minutes)..."
+# Step 5: Pre-download Pythia model
+log_info "Step 5: Pre-downloading Pythia-410M model (much faster than Gemma)..."
 python -c "
 import os
 from transformers import AutoModelForCausalLM, AutoTokenizer
-print('Downloading Gemma-2B model...')
+print('Downloading Pythia-410M model...')
 model = AutoModelForCausalLM.from_pretrained(
-    'google/gemma-2-2b', 
-    token=os.environ.get('HF_TOKEN'), 
+    'EleutherAI/pythia-410m', 
     device_map='cpu',
     cache_dir=os.environ.get('HF_HOME')
 )
-print('Downloading Gemma-2B tokenizer...')
+print('Downloading Pythia-410M tokenizer...')
 tokenizer = AutoTokenizer.from_pretrained(
-    'google/gemma-2-2b', 
-    token=os.environ.get('HF_TOKEN'), 
+    'EleutherAI/pythia-410m', 
     cache_dir=os.environ.get('HF_HOME')
 )
-print('✅ Gemma-2B model and tokenizer downloaded successfully!')
+print('✅ Pythia-410M model and tokenizer downloaded successfully!')
 "
-log_success "Gemma-2B model pre-downloaded"
+log_success "Pythia-410M model pre-downloaded"
 
 # Step 6: Install package in development mode
 log_info "Step 6: Installing polytope_hsae package in development mode..."

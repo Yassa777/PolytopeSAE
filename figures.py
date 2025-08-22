@@ -40,7 +40,7 @@ File names follow the spec (e.g., fig1_angles_distribution.png, table3_phase23_o
 
 Usage
 -----
-python figures.py --base runs/v2_focused --model google/gemma-2-2b --generate all
+python figures.py --base runs/v2_focused --model EleutherAI/pythia-410m --generate all
 python figures.py --base runs/v2_focused --generate fig1 fig5 fig9
 python figures.py --help
 
@@ -664,7 +664,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build figures & tables for Polytope→H‑SAE paper")
     parser.add_argument("--base", type=str, default="runs/v2_focused", help="Base directory containing phase outputs")
     parser.add_argument("--out", type=str, default=None, help="Output directory for figures (defaults to <base>/figures)")
-    parser.add_argument("--model", type=str, default="google/gemma-2-2b", help="HF model name for geometry recompute")
+    parser.add_argument("--model", type=str, default="EleutherAI/pythia-410m", help="HF model name for geometry recompute")
     parser.add_argument("--shrinkage", type=float, default=0.05, help="Covariance shrinkage for whitening")
     parser.add_argument("--no-hf", action="store_true", help="Disable HF‑based geometry recompute fallback")
     parser.add_argument("--generate", nargs="+", default=["all"],
