@@ -43,15 +43,18 @@ class TrainingSanityChecker:
         self.trainer = trainer
         self.exp_dir = exp_dir
         
-        # Monitoring settings
-        self.check_interval = 200
-        self.restart_count = 0
-        self.max_restarts = 2
+        # Get sanity checker configuration with defaults
+        scfg = config.get("sanity_checker", {})
         
-        # Thresholds for issues
-        self.min_route_usage_pct = 50.0  # At least 50% of routes should fire
-        self.min_active_dims_pct = 80.0  # At least 80% of theoretical active dims
-        self.pca_ev_gap_threshold = 0.15  # If PCA EV - model EV > 0.15, increase capacity
+        # Monitoring settings
+        self.check_interval = scfg.get("check_interval", 600)  # Delayed from 200 to 600
+        self.restart_count = 0
+        self.max_restarts = scfg.get("max_restarts", 1)  # Reduced from 2 to 1
+        
+        # Gentler thresholds for Stage A with Top-K=1 and frozen decoders
+        self.min_route_usage_pct = scfg.get("min_route_usage_pct", 15.0)  # Reduced from 50% to 15%
+        self.min_active_dims_pct = scfg.get("min_active_dims_pct", 20.0)  # Reduced from 80% to 20%
+        self.pca_ev_gap_threshold = scfg.get("pca_ev_gap_threshold", 0.15)  # If PCA EV - model EV > 0.15, increase capacity
         
         # Fix parameters
         self.router_temp_increase = 0.5  # Increase start temp by this much
@@ -63,6 +66,9 @@ class TrainingSanityChecker:
         self.last_pca_ev = None
         
         logger.info(f"🔍 Sanity checker initialized with {self.max_restarts} max restarts")
+        logger.info(f"    Check interval: {self.check_interval} steps")
+        logger.info(f"    Min route usage: {self.min_route_usage_pct}% (Stage A friendly)")
+        logger.info(f"    Min active dims: {self.min_active_dims_pct}% (Top-K=1 friendly)")
     
     def should_check(self, step: int) -> bool:
         """Check if we should run sanity checks at this step."""

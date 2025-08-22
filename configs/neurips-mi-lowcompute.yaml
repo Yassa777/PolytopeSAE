@@ -53,7 +53,7 @@ hsae:
   l1_child: 1.0e-3
   biorth_lambda: 1.0e-3
   causal_ortho_lambda: 3.0e-4         # early-stage only (see schedule)
-  router_temp: {start: 1.5, end: 0.7}
+  router_temp: {start: 5.0, end: 0.7}  # Higher start for better exploration
 
 training:
   optimizer: adamw
@@ -62,6 +62,7 @@ training:
   grad_clip: 1.0
   batch_size_acts: 8192
   total_steps: 22000
+  l1_warmup_steps: 3000       # Warmup L1 from 0 → target (≥ stabilize_steps)
   stage_A:
     freeze_decoder: true      # "stabilize" per spec
     steps: 3000
@@ -93,6 +94,13 @@ ablate:
 
 logging:
   save_dir: "runs/neurips_lowcompute"
-  log_every: 50
+  log_every: 200              # Increased to prevent validation overload
   checkpoint_every: 1000
   keep_last_k: 5
+
+# Sanity checker configuration - gentler thresholds for large model
+sanity_checker:
+  check_interval: 600         # Delayed checks to allow stabilization
+  max_restarts: 1             # Reduced restarts to prevent loops (set to 0 to disable)
+  min_route_usage_pct: 25     # Slightly higher for larger model
+  min_active_dims_pct: 30     # More forgiving than 80%

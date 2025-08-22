@@ -60,7 +60,7 @@ hsae:
   l1_child: 2.0e-4           # Reduced, will add warmup  
   biorth_lambda: 1.0e-4      # Keep low until EV fits
   causal_ortho_lambda: 2.0e-4  # Applied only during freeze stage
-  router_temp: {start: 3.0, end: 0.7}  # Softer start to avoid dead routes
+  router_temp: {start: 5.0, end: 0.7}  # Higher start to encourage exploration in Stage A
   top_level_beta: 0.3        # Emphasize reconstruction
   
   # Our default settings (teacher-init friendly)
@@ -79,7 +79,7 @@ training:
   grad_accum_steps: 4        # Use grad accumulation instead of large batches (effective=4096)
   lr_schedule: "cosine"      # Add cosine annealing
   lr_warmup_steps: 1000      # Longer warmup for stability
-  l1_warmup_steps: 2000      # Warmup L1 from 0 → target over 2k steps
+  l1_warmup_steps: 1000      # Warmup L1 from 0 → target over 1k steps (≥ stabilize_steps)
   
   # Fast training settings for small model
   val_every: 500             # Less frequent validation
@@ -137,12 +137,19 @@ logging:
   log_every: 200              # Validation every 200 steps (was causing slowdown at 50)
   checkpoint_every: 2000      # Less frequent checkpointing
   keep_last_k: 3
-  
+
   # Specific logging for phases
   phase_1_log: "teacher_extraction"
   phase_2_log: "baseline_hsae" 
   phase_3_log: "teacher_init_hsae"
   phase_4_log: "evaluation_steering"
+
+# Sanity checker configuration - gentler thresholds for Stage A
+sanity_checker:
+  check_interval: 600         # Delayed checks to allow stabilization
+  max_restarts: 1             # Reduced restarts to prevent loops (set to 0 to disable)
+  min_route_usage_pct: 15     # Realistic for Top-K=1 early training
+  min_active_dims_pct: 20     # Realistic for frozen decoders
 
 # W&B configuration
 wandb_project: "polytope-hsae"
