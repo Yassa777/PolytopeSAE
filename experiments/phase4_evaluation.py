@@ -69,127 +69,139 @@ def analyze_boundary_normal_alignment(model, val_loader, geometry, exp_dir, conf
         exp_dir: Experiment directory for saving results
     """
     logger.info("🔍 Analyzing boundary-normal alignment (normal-fan claim)")
-    
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import LabelEncoder
+
     import matplotlib.pyplot as plt
-    
+    from time import perf_counter
+
     model.eval()
     device = next(model.parameters()).device
-    
-    # Collect data for each parent
-    parent_data = {}  # parent_id -> {'projections': [], 'child_labels': []}
-    
+
+    # Collect data for each parent using tensor ops
+    parent_data = {}
+    start_collect = perf_counter()
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             if batch_idx > 50:  # Limit for efficiency
                 break
-                
+
             if isinstance(batch, (list, tuple)):
                 batch = batch[0]
             batch = batch.to(device)
-            
-            # Forward pass to get routing decisions
+
             x_hat, (parent_codes, child_codes), metrics = model(batch)
-            
-            # Get active parents and children
-            parent_indices = torch.nonzero(parent_codes > 0)  # [n_active, 2] (batch, parent)
-            
-            for batch_i, parent_i in parent_indices:
-                parent_id = f"parent_{parent_i.item()}"
-                
+
+            # Boolean mask of active parents per sample
+            active_mask = parent_codes > 0  # [batch, n_parents]
+            active_parents = torch.nonzero(active_mask.any(dim=0)).squeeze(1)
+
+            for parent_i in active_parents.tolist():
+                parent_id = f"parent_{parent_i}"
+                mask = active_mask[:, parent_i]
+
                 if parent_id not in parent_data:
-                    parent_data[parent_id] = {'projections': [], 'child_labels': [], 'parent_idx': parent_i.item()}
-                
-                # Get the activation for this sample
-                x_sample = batch[batch_i]  # [dim]
-                
-                # Project down to parent subspace
-                if hasattr(model, 'projectors') and parent_i.item() in model.projectors:
-                    down_proj, up_proj = model.projectors[parent_i.item()]
-                    x_proj = x_sample @ down_proj.T  # [subspace_dim]
-                    
-                    # Get child decision
-                    child_logits = model.child_encoders[parent_i.item()](x_proj.unsqueeze(0))  # [1, m_low]
-                    child_decision = torch.argmax(child_logits, dim=1).item()
-                    
-                    parent_data[parent_id]['projections'].append(x_proj.cpu().numpy())
-                    parent_data[parent_id]['child_labels'].append(child_decision)
-    
-    # Analyze each parent that has sufficient data
+                    parent_data[parent_id] = {
+                        'projections': [],
+                        'child_labels': [],
+                        'parent_idx': parent_i,
+                    }
+
+                x_parent = batch[mask]
+                down_proj, _ = model.projectors[parent_i]
+                x_proj = x_parent @ down_proj.T
+                child_logits = model.child_encoders[parent_i](x_proj)
+                child_decision = torch.argmax(child_logits, dim=1)
+
+                parent_data[parent_id]['projections'].append(x_proj.cpu())
+                parent_data[parent_id]['child_labels'].append(child_decision.cpu())
+
+    collect_time = perf_counter() - start_collect
+    logger.info(f"Collected parent data in {collect_time:.2f}s")
+
+    # Stack tensors into NumPy arrays
+    for data in parent_data.values():
+        data['projections'] = torch.cat(data['projections'], dim=0).numpy()
+        data['child_labels'] = torch.cat(data['child_labels'], dim=0).numpy()
+
+    from polytope_hsae.logistic_regression import (
+        fit_logistic_regressions_parallel,
+        fit_logistic_regressions,
+    )
+
+    # Prepare datasets with sufficient samples
+    parent_datasets = {
+        pid: (d['projections'], d['child_labels'])
+        for pid, d in parent_data.items()
+        if len(d['projections']) >= 20
+    }
+
+    start_parallel = perf_counter()
+    coef_parallel = fit_logistic_regressions_parallel(parent_datasets)
+    parallel_time = perf_counter() - start_parallel
+    logger.info(
+        f"Fitted {len(coef_parallel)} logistic models in {parallel_time:.2f}s using joblib"
+    )
+
+    # Optional sequential verification and speedup measurement
+    start_seq = perf_counter()
+    coef_seq = fit_logistic_regressions(parent_datasets)
+    seq_time = perf_counter() - start_seq
+    speedup = seq_time / max(parallel_time, 1e-8)
+    logger.info(
+        f"Sequential fitting took {seq_time:.2f}s; speedup = {speedup:.2f}x"
+    )
+
+    # Verify coefficients match
+    for pid, coef in coef_parallel.items():
+        if pid in coef_seq:
+            if not np.allclose(coef['coef'], coef_seq[pid]['coef']):
+                logger.warning(f"Coefficient mismatch for {pid}")
+
+    # Analyze each parent using fitted coefficients
     alignment_results = {}
     angle_distributions = []
-    
-    for parent_id, data in parent_data.items():
-        if len(data['projections']) < 20:  # Need sufficient samples
-            continue
-            
-        logger.info(f"Analyzing parent {parent_id} with {len(data['projections'])} samples")
-        
-        X = np.array(data['projections'])  # [n_samples, subspace_dim]
-        y = np.array(data['child_labels'])  # [n_samples]
-        
-        # Check if we have multiple classes
-        unique_classes = np.unique(y)
-        if len(unique_classes) < 2:
-            continue
-        
-        try:
-            # Fit multinomial logistic regression
-            clf = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000)
-            clf.fit(X, y)
-            
-            # Get decision boundaries (normals in subspace)
-            normals_subspace = clf.coef_  # [n_classes, subspace_dim]
-            
-            # Map back to full space using up_projector
-            parent_idx = data['parent_idx']
-            if hasattr(model, 'projectors') and parent_idx in model.projectors:
-                down_proj, up_proj = model.projectors[parent_idx]
-                
-                # Map normals back up: n_full = up_proj @ n_subspace
-                normals_full = normals_subspace @ up_proj  # [n_classes, full_dim]
-                
-                # Compare with teacher child deltas
-                teacher_file = Path(config["logging"]["save_dir"]) / config["logging"]["phase_1_log"] / "teacher_vectors.json"
-                if teacher_file.exists():
-                    with open(teacher_file, 'r') as f:
-                        teacher_data = json.load(f)
-                    
-                    parent_key = f"parent_{parent_idx}"
-                    if parent_key in teacher_data.get("child_deltas", {}):
-                        child_deltas = teacher_data["child_deltas"][parent_key]
-                        
-                        # Compute angles between learned normals and teacher deltas
-                        angles = []
-                        for class_idx, normal in enumerate(normals_full):
-                            normal_tensor = torch.tensor(normal, dtype=torch.float32)
-                            
-                            # Find corresponding teacher delta (if exists)
-                            child_key = f"child_{class_idx}"
-                            if child_key in child_deltas:
-                                teacher_delta = torch.tensor(child_deltas[child_key], dtype=torch.float32)
-                                
-                                # Compute causal angle using geometry
-                                angle_rad = geometry.causal_angle(normal_tensor, teacher_delta)
-                                angle_deg = torch.rad2deg(angle_rad).item()
-                                angles.append(angle_deg)
-                        
-                        if angles:
-                            median_angle = np.median(angles)
-                            alignment_results[parent_id] = {
-                                'median_angle_deg': median_angle,
-                                'all_angles_deg': angles,
-                                'n_samples': len(data['projections']),
-                                'n_classes': len(unique_classes)
-                            }
-                            angle_distributions.extend(angles)
-                            
-                            logger.info(f"Parent {parent_id}: median angle = {median_angle:.1f}°")
-        
-        except Exception as e:
-            logger.warning(f"Failed to analyze parent {parent_id}: {e}")
-            continue
+
+    teacher_file = (
+        Path(config["logging"]["save_dir"]) / config["logging"]["phase_1_log"] / "teacher_vectors.json"
+    )
+    teacher_data = {}
+    if teacher_file.exists():
+        with open(teacher_file, 'r') as f:
+            teacher_data = json.load(f)
+
+    for parent_id, (X, y) in parent_datasets.items():
+        normals_subspace = coef_parallel[parent_id]['coef']
+        parent_idx = parent_data[parent_id]['parent_idx']
+        if hasattr(model, 'projectors') and parent_idx in model.projectors:
+            down_proj, up_proj = model.projectors[parent_idx]
+            normals_full = normals_subspace @ up_proj.cpu().numpy()
+
+            parent_key = f"parent_{parent_idx}"
+            if parent_key in teacher_data.get("child_deltas", {}):
+                child_deltas = teacher_data["child_deltas"][parent_key]
+                angles = []
+                for class_idx, normal in enumerate(normals_full):
+                    normal_tensor = torch.tensor(normal, dtype=torch.float32)
+                    child_key = f"child_{class_idx}"
+                    if child_key in child_deltas:
+                        teacher_delta = torch.tensor(
+                            child_deltas[child_key], dtype=torch.float32
+                        )
+                        angle_rad = geometry.causal_angle(normal_tensor, teacher_delta)
+                        angle_deg = torch.rad2deg(angle_rad).item()
+                        angles.append(angle_deg)
+
+                if angles:
+                    median_angle = np.median(angles)
+                    alignment_results[parent_id] = {
+                        'median_angle_deg': median_angle,
+                        'all_angles_deg': angles,
+                        'n_samples': len(X),
+                        'n_classes': normals_subspace.shape[0],
+                    }
+                    angle_distributions.extend(angles)
+                    logger.info(
+                        f"Parent {parent_id}: median angle = {median_angle:.1f}°"
+                    )
     
     # Save results
     fan_alignment_file = exp_dir / "fan_alignment.json"
