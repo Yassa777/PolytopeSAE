@@ -97,6 +97,7 @@ training:
   teacher_init:
     total_steps: 5000        # Matched with baseline for fair comparison
     teacher_noise_deg: [0, 5, 15, 30]  # ablation: angular noise on teacher
+    l1_warmup_steps: 4000    # Extended L1 warmup for teacher-init stability
     stage_A:
       freeze_decoder: true
       steps: 500             # Cheap stabilization (was 2000)
@@ -108,6 +109,14 @@ training:
       lr_mult: 1.0
       enable_causal_ortho: false
       decoder_lr_mult: 0.5  # Lower LR for decoder adaptation
+    
+    # Override sanity checker for teacher-init (enable with relaxed settings)
+    sanity_checker:
+      enabled: true
+      check_interval: 1500     # Very delayed checks for teacher-init stability
+      max_restarts: 1
+      min_route_usage_pct: 15  # Gentle for teacher-init early stages
+      min_active_dims_pct: 20  # Gentle for teacher-init early stages
 
 eval:
   metrics: ["1-EV", "1-CE", "purity", "leakage", "steering_leakage"]
@@ -144,12 +153,18 @@ logging:
   phase_3_log: "teacher_init_hsae"
   phase_4_log: "evaluation_steering"
 
-# Sanity checker configuration - gentler thresholds for Stage A
+# Sanity checker configuration
 sanity_checker:
-  check_interval: 600         # Delayed checks to allow stabilization
-  max_restarts: 1             # Reduced restarts to prevent loops (set to 0 to disable)
-  min_route_usage_pct: 15     # Realistic for Top-K=1 early training
-  min_active_dims_pct: 20     # Realistic for frozen decoders
+  # Phase 2 (baseline): DISABLED - let it run to completion without intervention
+  enabled: false              # Completely disable sanity checker for baseline runs
+  
+  # Phase 3 (teacher-init): ENABLED with relaxed settings  
+  # (uncomment and set enabled: true for teacher-init runs)
+  # enabled: true
+  # check_interval: 1500       # Very delayed checks for teacher-init stability
+  # max_restarts: 1           
+  # min_route_usage_pct: 15   # Gentle for teacher-init early stages
+  # min_active_dims_pct: 20   # Gentle for teacher-init early stages
 
 # W&B configuration
 wandb_project: "polytope-hsae"

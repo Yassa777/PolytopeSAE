@@ -308,6 +308,15 @@ def _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry
         logger.info(f"🔧 Validation batch size adjusted: {batch_size} → {val_batch_size}")
         logger.info(f"   Reason: Validation dataset has {n_val} samples")
 
+    # Apply teacher_init specific config overrides before trainer initialization
+    teacher_init_config = config.get("training", {}).get("teacher_init", {})
+    
+    # Override L1 warmup steps for teacher_init if specified
+    teacher_init_l1_warmup = teacher_init_config.get("l1_warmup_steps")
+    if teacher_init_l1_warmup is not None:
+        config["training"]["l1_warmup_steps"] = teacher_init_l1_warmup
+        logger.info(f"🔄 Using teacher_init L1 warmup: {teacher_init_l1_warmup} steps")
+
     # Get dataloader config
     dl_config = config.get("dataloader", {})
     
@@ -347,8 +356,15 @@ def _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry
     else:
         logger.warning("⚠️  CUDA not available - running on CPU")
     
-    # Initialize sanity checker
-    sanity_checker = TrainingSanityChecker(config, model, trainer, exp_dir)
+    # Initialize sanity checker with teacher_init specific overrides
+    teacher_config = config.copy()
+    teacher_init_sanity = teacher_init_config.get("sanity_checker", {})
+    if teacher_init_sanity:
+        # Override sanity checker config with teacher_init specific settings
+        teacher_config.setdefault("sanity_checker", {}).update(teacher_init_sanity)
+        logger.info("🔍 Using teacher_init specific sanity checker settings")
+    
+    sanity_checker = TrainingSanityChecker(teacher_config, model, trainer, exp_dir)
     logger.info("🔍 Sanity checker initialized")
 
     # Initialize W&B

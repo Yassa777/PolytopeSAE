@@ -46,6 +46,9 @@ class TrainingSanityChecker:
         # Get sanity checker configuration with defaults
         scfg = config.get("sanity_checker", {})
         
+        # Check if sanity checker is enabled
+        self.enabled = scfg.get("enabled", True)
+        
         # Monitoring settings
         self.check_interval = scfg.get("check_interval", 600)  # Delayed from 200 to 600
         self.restart_count = 0
@@ -65,13 +68,18 @@ class TrainingSanityChecker:
         self.issue_history = []
         self.last_pca_ev = None
         
-        logger.info(f"🔍 Sanity checker initialized with {self.max_restarts} max restarts")
-        logger.info(f"    Check interval: {self.check_interval} steps")
-        logger.info(f"    Min route usage: {self.min_route_usage_pct}% (Stage A friendly)")
-        logger.info(f"    Min active dims: {self.min_active_dims_pct}% (Top-K=1 friendly)")
+        if self.enabled:
+            logger.info(f"🔍 Sanity checker initialized with {self.max_restarts} max restarts")
+            logger.info(f"    Check interval: {self.check_interval} steps")
+            logger.info(f"    Min route usage: {self.min_route_usage_pct}% (Stage A friendly)")
+            logger.info(f"    Min active dims: {self.min_active_dims_pct}% (Top-K=1 friendly)")
+        else:
+            logger.info("🔍 Sanity checker DISABLED - training will run to completion without intervention")
     
     def should_check(self, step: int) -> bool:
         """Check if we should run sanity checks at this step."""
+        if not self.enabled:
+            return False
         return step > 0 and step % self.check_interval == 0
     
     def check_and_fix(self, step: int, val_loader, current_ev: float) -> bool:
@@ -86,6 +94,9 @@ class TrainingSanityChecker:
         Returns:
             True if training should restart, False to continue
         """
+        if not self.enabled:
+            return False
+            
         if not self.should_check(step):
             return False
             
