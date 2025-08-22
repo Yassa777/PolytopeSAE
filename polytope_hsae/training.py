@@ -370,8 +370,7 @@ class HSAETrainer:
             )
         except TrainingRestartException as e:
             logger.info(f"Training interrupted for restart: {e}")
-            # Return partial history - caller will handle restart
-            return history
+            raise  # let the calling phase script handle the restart
         logger.info("Baseline training completed")
         return history
 
@@ -455,8 +454,7 @@ class HSAETrainer:
             )
         except TrainingRestartException as e:
             logger.info(f"Training interrupted for restart: {e}")
-            # Return partial history - caller will handle restart
-            return history
+            raise  # let the calling phase script handle the restart
 
         logger.info("Teacher-initialized training completed")
         return history

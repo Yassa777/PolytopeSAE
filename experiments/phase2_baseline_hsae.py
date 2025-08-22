@@ -374,7 +374,7 @@ def _train_baseline_hsae_single_attempt(model, dataset, config, exp_dir, attempt
                 
                 x_hat, (parent_codes, child_codes), model_metrics = model(batch_data)
                 
-                from polytope_hsae.metrics import compute_explained_variance, compute_cross_entropy_proxy
+                from polytope_hsae.metrics import compute_cross_entropy_proxy
                 ev = compute_explained_variance(batch_data, x_hat)
                 ce = compute_cross_entropy_proxy(batch_data, x_hat)
                 
