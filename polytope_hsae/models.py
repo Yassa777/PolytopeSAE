@@ -297,12 +297,17 @@ class HierarchicalSAE(nn.Module):
                             child_deltas[i, j] = geometry.random_rotate(child_deltas[i, j], init_jitter_deg)
 
             if seed_parent_decoder:
-                self.router.decoder.weight.copy_(parent_vectors.T)
+                # Seed as many parents as we have teacher vectors
+                n_avail = parent_vectors.shape[0]
+                n_model = self.config.n_parents
+                n = min(n_avail, n_model)
+                self.router.decoder.weight[:, :n].copy_(parent_vectors[:n].T)
+                if n < n_model:
+                    logger.warning(f"Only seeding {n}/{n_model} parents from teacher; leaving the rest random.")
                 if geometry is not None:
-                    for i in range(self.config.n_parents):
+                    for i in range(n):
                         parent_vec = self.router.decoder.weight[:, i]
-                        normalized_vec = geometry.normalize_causal(parent_vec)
-                        self.router.decoder.weight[:, i] = normalized_vec
+                        self.router.decoder.weight[:, i] = geometry.normalize_causal(parent_vec)
 
             if seed_projectors:
                 for i, (down_proj, up_proj) in enumerate(child_projectors):
