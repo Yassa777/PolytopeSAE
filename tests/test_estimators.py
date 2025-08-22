@@ -73,8 +73,15 @@ def test_child_delta_uses_raw_vectors():
     }
 
     parent_vectors = estimator.estimate_parent_vectors(parent_activations)
-    child_deltas = estimator.estimate_child_deltas(parent_vectors, child_activations)
+    child_vecs, child_deltas = estimator.estimate_child_deltas(parent_vectors, child_activations)
     delta = child_deltas["p"]["c"]
 
-    expected = torch.tensor([0.0, 3.0]) - torch.tensor([2.0, 0.0])
-    assert torch.allclose(delta, expected)
+    expected = geom.normalize_causal(
+        child_vecs["p"]["c"] - parent_vectors["p"]
+    )
+
+    assert torch.allclose(delta, expected, atol=1e-6)
+    # All vectors should be unit causal norm
+    assert torch.allclose(geom.causal_norm(parent_vectors["p"]), torch.tensor(1.0))
+    assert torch.allclose(geom.causal_norm(child_vecs["p"]["c"]), torch.tensor(1.0))
+    assert torch.allclose(geom.causal_norm(delta), torch.tensor(1.0))

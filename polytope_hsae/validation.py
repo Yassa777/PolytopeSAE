@@ -6,6 +6,7 @@ experiments to validate the geometric structure of concept hierarchies.
 """
 
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -34,6 +35,7 @@ class GeometryValidator:
     def test_hierarchical_orthogonality(
         self,
         parent_vectors: Dict[str, torch.Tensor],
+        child_vectors: Dict[str, Dict[str, torch.Tensor]],
         child_deltas: Dict[str, Dict[str, torch.Tensor]],
         threshold_degrees: float = 80.0,
     ) -> Dict[str, Any]:
@@ -51,39 +53,48 @@ class GeometryValidator:
         logger.info("Testing hierarchical orthogonality")
 
         angles_deg = []
-        inner_products = []
+        cosines = []
+        p_norms = []
+        c_norms = []
+        d_norms = []
         parent_child_pairs = []
 
         for parent_id, deltas in child_deltas.items():
-            if parent_id not in parent_vectors:
+            if parent_id not in parent_vectors or parent_id not in child_vectors:
                 continue
 
             parent_vector = parent_vectors[parent_id]
 
             for child_id, delta in deltas.items():
-                if torch.norm(delta) < 1e-6:  # Skip zero deltas
+                if child_id not in child_vectors[parent_id]:
+                    continue
+                child_vec = child_vectors[parent_id][child_id]
+                if torch.norm(delta) < 1e-6:
                     continue
 
-                # Compute angle and inner product
-                angle_rad = self.geometry.causal_angle(parent_vector, delta)
-                angle_deg = torch.rad2deg(angle_rad).item()
-                inner_prod = self.geometry.causal_inner_product(
-                    parent_vector, delta
-                ).item()
+                cos_t = self.geometry.causal_inner_product(parent_vector, delta).item()
+                cos_t = max(-1.0, min(1.0, cos_t))
+                angle_deg = math.degrees(math.acos(cos_t))
 
                 angles_deg.append(angle_deg)
-                inner_products.append(inner_prod)
+                cosines.append(cos_t)
+                p_norms.append(self.geometry.causal_norm(parent_vector).item())
+                c_norms.append(self.geometry.causal_norm(child_vec).item())
+                d_norms.append(self.geometry.causal_norm(delta).item())
                 parent_child_pairs.append((parent_id, child_id))
 
         angles_deg = np.array(angles_deg)
-        inner_products = np.array(inner_products)
+        cosines = np.array(cosines)
 
         details_df = pd.DataFrame(
             {
                 "parent_id": [p for p, _ in parent_child_pairs],
                 "child_id": [c for _, c in parent_child_pairs],
                 "angle_deg": angles_deg,
-                "inner_product": inner_products,
+                "cosine": cosines,
+                "parent_norm": p_norms,
+                "child_norm": c_norms,
+                "delta_norm": d_norms,
             }
         )
 
@@ -91,9 +102,12 @@ class GeometryValidator:
         results = {
             "n_pairs": len(angles_deg),
             "angles_deg": angles_deg,
-            "inner_products": inner_products,
+            "cosines": cosines,
             "parent_child_pairs": parent_child_pairs,
             "details": details_df,
+            "Sigma_top_eigenvalues": np.sort(
+                torch.linalg.eigvalsh(self.geometry.Sigma).cpu().numpy()
+            )[::-1][:5].tolist(),
             # Angle statistics
             "median_angle_deg": np.median(angles_deg),
             "mean_angle_deg": np.mean(angles_deg),
@@ -104,10 +118,10 @@ class GeometryValidator:
             "fraction_above_threshold": np.mean(angles_deg >= threshold_degrees),
             "fraction_above_85deg": np.mean(angles_deg >= 85.0),
             "fraction_above_87deg": np.mean(angles_deg >= 87.0),
-            # Inner product statistics (should be near zero)
-            "mean_abs_inner_product": np.mean(np.abs(inner_products)),
-            "median_abs_inner_product": np.median(np.abs(inner_products)),
-            "max_abs_inner_product": np.max(np.abs(inner_products)),
+            # Cosine statistics
+            "mean_cosine": np.mean(cosines),
+            "median_cosine": np.median(cosines),
+            "max_abs_cosine": np.max(np.abs(cosines)),
         }
 
         # Statistical test: are angles significantly > 80 degrees?
@@ -274,6 +288,7 @@ class GeometryValidator:
     def run_control_experiments(
         self,
         parent_vectors: Dict[str, torch.Tensor],
+        child_vectors: Dict[str, Dict[str, torch.Tensor]],
         child_deltas: Dict[str, Dict[str, torch.Tensor]],
         unembedding_matrix: torch.Tensor,
         n_shuffles: int = 100,
@@ -293,14 +308,15 @@ class GeometryValidator:
         logger.info("Running control experiments")
 
         results = {
-            "shuffled_unembedding": [],
             "random_parent_replacement": [],
             "label_permutation": [],
+            "sibling_swap": [],
+            "euclidean_metric": [],
         }
 
         # Original orthogonality scores
         original_orthogonality = self.test_hierarchical_orthogonality(
-            parent_vectors, child_deltas
+            parent_vectors, child_vectors, child_deltas
         )
         original_median_angle = original_orthogonality["median_angle_deg"]
 
@@ -328,24 +344,12 @@ class GeometryValidator:
             else torch.empty(0, unembedding_matrix.shape[1])
         )
 
+        identity_geometry = self.geometry.__class__(
+            unembedding_matrix, whitening="identity", shrinkage=self.geometry.shrinkage
+        )
+
         for _ in tqdm(range(n_shuffles), desc="Control shuffles"):
-            # Control 1: Shuffled unembedding rows
-            shuffled_U = unembedding_matrix[torch.randperm(unembedding_matrix.shape[0])]
-            shuffled_geometry = self.geometry.__class__(
-                shuffled_U, self.geometry.shrinkage
-            )
-
-            if len(parent_stack) > 0:
-                angles = (
-                    torch.rad2deg(
-                        shuffled_geometry.causal_angle(parent_stack, delta_stack)
-                    )
-                    .cpu()
-                    .numpy()
-                )
-                results["shuffled_unembedding"].append(np.median(angles))
-
-            # Control 2: Random parent replacement
+            # Control 1: Random parent replacement
             if len(parent_tensor) >= 2 and len(delta_stack) > 0:
                 rand_idx = torch.randint(len(parent_tensor), (len(delta_stack),))
                 rand_parents = parent_tensor[rand_idx]
@@ -356,7 +360,7 @@ class GeometryValidator:
                 )
                 results["random_parent_replacement"].append(np.median(angles))
 
-            # Control 3: Label permutation - pair random parents with random deltas
+            # Control 2: Label permutation - pair random parents with random deltas
             if len(parent_tensor) > 0 and len(delta_stack) > 0:
                 rand_parents = parent_tensor[
                     torch.randint(len(parent_tensor), (len(delta_stack),))
@@ -371,19 +375,59 @@ class GeometryValidator:
                 )
                 results["label_permutation"].append(np.median(angles))
 
+            # Control 3: Sibling swap preserving parent counts
+            if len(delta_stack) > 0 and parent_vectors:
+                perm = torch.randperm(len(delta_stack))
+                angles_all = []
+                idx = 0
+                for pid, deltas in child_deltas.items():
+                    count = len(deltas)
+                    if count == 0 or pid not in parent_vectors:
+                        continue
+                    sel = delta_stack[perm[idx:idx + count]]
+                    pv = parent_vectors[pid].expand(sel.shape[0], -1)
+                    ang = (
+                        torch.rad2deg(self.geometry.causal_angle(pv, sel))
+                        .cpu()
+                        .numpy()
+                    )
+                    angles_all.extend(ang)
+                    idx += count
+                if angles_all:
+                    results["sibling_swap"].append(np.median(angles_all))
+
+            # Control 4: Euclidean metric ablation
+            if len(parent_stack) > 0:
+                angles = (
+                    torch.rad2deg(
+                        identity_geometry.causal_angle(parent_stack, delta_stack)
+                    )
+                    .cpu()
+                    .numpy()
+                )
+                results["euclidean_metric"].append(np.median(angles))
+
         # Compute summary statistics for controls
+        def _bootstrap_ci(values: np.ndarray, n: int = 1000) -> Tuple[float, float]:
+            rng = np.random.default_rng(seed=0)
+            meds = []
+            for _ in range(n):
+                sample = rng.choice(values, size=len(values), replace=True)
+                meds.append(np.median(sample))
+            return tuple(np.percentile(meds, [2.5, 97.5]))
+
         summary = {"original_median_angle": original_median_angle, "controls": {}}
 
         for control_name, angles in results.items():
             if angles:
+                arr = np.array(angles)
+                ci_lo, ci_hi = _bootstrap_ci(arr)
                 summary["controls"][control_name] = {
-                    "median_angle": np.median(angles),
-                    "mean_angle": np.mean(angles),
-                    "std_angle": np.std(angles),
-                    "effect_size_vs_original": (original_median_angle - np.mean(angles))
-                    / np.std(angles)
-                    if np.std(angles) > 0
-                    else 0,
+                    "median_angle": float(np.median(arr)),
+                    "median_angle_ci": (float(ci_lo), float(ci_hi)),
+                    "effect_size_vs_original": float(
+                        original_median_angle - np.median(arr)
+                    ),
                 }
 
         return {"raw_results": results, "summary": summary}

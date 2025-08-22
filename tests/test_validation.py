@@ -11,16 +11,21 @@ def test_hierarchical_orthogonality_returns_dataframe():
     geometry = CausalGeometry(U)
     validator = GeometryValidator(geometry)
 
-    parent_vectors = {"p": torch.tensor([1.0, 0.0, 0.0, 0.0])}
-    child_deltas = {"p": {"c": torch.tensor([0.0, 1.0, 0.0, 0.0])}}
+    parent_vectors = {"p": geometry.normalize_causal(torch.tensor([1.0, 0.0, 0.0, 0.0]))}
+    child_vectors = {"p": {"c": geometry.normalize_causal(torch.tensor([0.0, 1.0, 0.0, 0.0]))}}
+    delta = geometry.normalize_causal(child_vectors["p"]["c"] - parent_vectors["p"])
+    child_deltas = {"p": {"c": delta}}
 
-    results = validator.test_hierarchical_orthogonality(parent_vectors, child_deltas)
+    results = validator.test_hierarchical_orthogonality(parent_vectors, child_vectors, child_deltas)
     assert isinstance(results["details"], pd.DataFrame)
     assert set(results["details"].columns) == {
         "parent_id",
         "child_id",
         "angle_deg",
-        "inner_product",
+        "cosine",
+        "parent_norm",
+        "child_norm",
+        "delta_norm",
     }
     assert len(results["details"]) == 1
 
