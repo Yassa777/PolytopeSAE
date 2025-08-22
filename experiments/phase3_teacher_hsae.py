@@ -182,8 +182,11 @@ def create_teacher_hsae(config, input_dim: int, parent_vectors, child_deltas, pr
     projector_list = list(projectors.values())[: hsae_config.n_parents]
 
     # Convert child deltas to tensor
+    # Get dtype from first available delta to match parent_tensor dtype
+    first_delta = next(iter(next(iter(child_deltas.values())).values()))
     child_tensor = torch.zeros(
-        hsae_config.n_parents, hsae_config.n_children_per_parent, input_dim
+        hsae_config.n_parents, hsae_config.n_children_per_parent, input_dim,
+        dtype=first_delta.dtype
     )
     for i, deltas in enumerate(child_deltas.values()):
         if i >= hsae_config.n_parents:

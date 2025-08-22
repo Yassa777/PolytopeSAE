@@ -362,6 +362,7 @@ class HierarchicalSAE(nn.Module):
             self.config.n_parents,
             self.config.n_children_per_parent,
             device=x.device,
+            dtype=x.dtype,
         )
         child_codes = torch.zeros_like(child_logits)
 
@@ -375,9 +376,14 @@ class HierarchicalSAE(nn.Module):
                 logits_p = checkpoint(sub.encode, x_subspace)
             else:
                 logits_p = sub.encode(x_subspace)
+            # ensure dtype matches destination (bf16 under AMP)
+            if logits_p.dtype != child_logits.dtype:
+                logits_p = logits_p.to(child_logits.dtype)
             child_logits[active_mask, parent_idx] = logits_p
 
             child_codes_p = self._sample_codes(logits_p, self.config.topk_child)
+            if child_codes_p.dtype != child_codes.dtype:
+                child_codes_p = child_codes_p.to(child_codes.dtype)
             child_codes[active_mask, parent_idx] = child_codes_p
 
         return child_logits, child_codes
@@ -397,7 +403,8 @@ class HierarchicalSAE(nn.Module):
         """
         batch_size = parent_codes.shape[0]
         reconstruction = torch.zeros(
-            batch_size, self.config.input_dim, device=parent_codes.device
+            batch_size, self.config.input_dim,
+            device=parent_codes.device, dtype=parent_codes.dtype
         )
 
         parent_recon = self.router.decode(
@@ -439,7 +446,7 @@ class HierarchicalSAE(nn.Module):
             reconstruction[active_mask] += child_recon_full
 
         if self.config.use_decoder_bias:
-            reconstruction += self.decoder_bias
+            reconstruction += self.decoder_bias.to(reconstruction.dtype)
 
         return reconstruction
 
@@ -469,7 +476,7 @@ class HierarchicalSAE(nn.Module):
             parent_codes, self.config.use_tied_decoders_parent
         )
         if self.config.use_decoder_bias:
-            parent_recon += self.decoder_bias
+            parent_recon += self.decoder_bias.to(parent_recon.dtype)
 
         # Compute metrics
         metrics = {
