@@ -497,25 +497,25 @@ class HierarchicalSAE(nn.Module):
         Returns:
             Orthogonality penalty scalar
         """
-        penalty = 0
+        device = self.router.decoder.weight.device
+        W = geometry.W.to(device=device, dtype=self.router.decoder.weight.dtype)  # [d,d]
 
-        for parent_idx, sub in enumerate(self.subspaces):
-            parent_vector = self.router.decoder.weight[:, parent_idx]
+        P = self.router.decoder.weight  # [d, P]
+        P_w = W @ P                     # [d, P]
 
-            for child_idx in range(self.config.n_children_per_parent):
-                child_subspace = sub.decoder.weight[:, child_idx]
-                if self.config.tie_projectors:
-                    child_full = F.linear(
-                        child_subspace.unsqueeze(0), sub.down_projector.weight
-                    ).squeeze(0)
-                else:
-                    child_full = sub.up_projector(child_subspace.unsqueeze(0)).squeeze(
-                        0
-                    )
+        penalty = P.new_zeros(())
+        # Loop parents (different modules per parent), but not children
+        for i, sub in enumerate(self.subspaces):
+            if self.config.tie_projectors:
+                child_full = sub.down_projector.weight.t() @ sub.decoder.weight
+            else:
+                child_full = sub.up_projector.weight @ sub.decoder.weight
+            delta = child_full - P[:, i:i+1]
 
-                delta = child_full - parent_vector
-                inner_prod = geometry.causal_inner_product(parent_vector, delta)
-                penalty += inner_prod**2
+            Pw_i = P_w[:, i:i+1]
+            Dw_i = W @ delta
+            inner = (Pw_i * Dw_i).sum(dim=0)
+            penalty = penalty + (inner ** 2).sum()
 
         return self.config.causal_ortho_lambda * penalty
 
