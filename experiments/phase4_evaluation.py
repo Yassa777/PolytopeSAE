@@ -255,7 +255,7 @@ def load_models_and_data(config):
     # Load teacher model
     if teacher_model_file.exists():
         logger.info(f"Loading teacher-initialized model from {teacher_model_file}")
-        checkpoint = torch.load(teacher_model_file, map_location="cpu")
+        checkpoint = torch.load(teacher_model_file, map_location="cpu", weights_only=False)
         teacher_model = HierarchicalSAE(checkpoint["model_config"])
         teacher_model.load_state_dict(checkpoint["model_state_dict"])
         models["teacher"] = teacher_model
@@ -265,7 +265,7 @@ def load_models_and_data(config):
     # Load baseline model
     if baseline_model_file.exists():
         logger.info(f"Loading baseline model from {baseline_model_file}")
-        checkpoint = torch.load(baseline_model_file, map_location="cpu")
+        checkpoint = torch.load(baseline_model_file, map_location="cpu", weights_only=False)
         baseline_model = HierarchicalSAE(checkpoint["model_config"])
         baseline_model.load_state_dict(checkpoint["model_state_dict"])
         models["baseline"] = baseline_model
