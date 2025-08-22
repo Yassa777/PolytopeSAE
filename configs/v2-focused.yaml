@@ -134,7 +134,7 @@ ablate:
 
 logging:
   save_dir: "runs/v2_focused"
-  log_every: 50               # Throttled logging (every 50 steps)
+  log_every: 200              # Validation every 200 steps (was causing slowdown at 50)
   checkpoint_every: 2000      # Less frequent checkpointing
   keep_last_k: 3
   

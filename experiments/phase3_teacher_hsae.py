@@ -308,18 +308,25 @@ def _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry
         logger.info(f"🔧 Validation batch size adjusted: {batch_size} → {val_batch_size}")
         logger.info(f"   Reason: Validation dataset has {n_val} samples")
 
+    # Get dataloader config
+    dl_config = config.get("dataloader", {})
+    
     train_loader = create_data_loader(
         train_ds,
         batch_size=batch_size,
         device=config["run"]["device"],
         shuffle=True,
+        num_workers=dl_config.get("num_workers", None),
+        pin_memory=dl_config.get("pin_memory", None),
     )
     val_loader = create_data_loader(
         val_ds,
         batch_size=val_batch_size,
         device=config["run"]["device"],
         shuffle=False,
-        drop_last=False,
+        drop_last=False,  # Always keep validation samples
+        num_workers=dl_config.get("num_workers", None),
+        pin_memory=dl_config.get("pin_memory", None),
     )
 
     # Initialize trainer
@@ -328,7 +335,17 @@ def _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry
         config=config,
         geometry=geometry,  # Provide geometry for causal orthogonality
         use_wandb=True,
+        use_compile=False,  # Disable torch.compile for faster short runs
     )
+    
+    # Verify GPU usage
+    logger.info(f"🔧 Device verification: {trainer.device}")
+    logger.info(f"🔧 Model on device: {next(model.parameters()).device}")
+    if torch.cuda.is_available():
+        logger.info(f"🔧 CUDA available: {torch.cuda.device_count()} devices")
+        logger.info(f"🔧 Current CUDA device: {torch.cuda.current_device()}")
+    else:
+        logger.warning("⚠️  CUDA not available - running on CPU")
     
     # Initialize sanity checker
     sanity_checker = TrainingSanityChecker(config, model, trainer, exp_dir)
