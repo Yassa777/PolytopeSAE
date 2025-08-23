@@ -14,8 +14,15 @@ from typing import Dict, Any, Optional
 
 import numpy as np
 import torch
-import wandb
 import yaml
+
+# Handle wandb import gracefully
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    logger.warning("W&B not available - install with: pip install wandb")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -66,26 +73,44 @@ def extract_whitening_metrics(base_path: Path) -> Dict[str, Any]:
     metrics = {}
     try:
         geom_file = base_path / "teacher_extraction" / "geometry.pt"
-        geom = torch.load(geom_file, map_location="cpu")
-        W = geom.W.numpy()
+        geom_data = torch.load(geom_file, map_location="cpu")
         
-        # Whitening matrix should satisfy W @ W.T ≈ I
-        gram = W @ W.T
-        diag_vals = np.diag(gram)
+        # Handle different possible formats
+        W = None
+        if hasattr(geom_data, 'W'):
+            W = geom_data.W.numpy()
+        elif isinstance(geom_data, dict) and 'W' in geom_data:
+            W = geom_data['W'].numpy()
+        elif isinstance(geom_data, dict) and 'whitening_matrix' in geom_data:
+            W = geom_data['whitening_matrix'].numpy()
+        else:
+            # Try to find any matrix-like object
+            for key, value in geom_data.items() if isinstance(geom_data, dict) else []:
+                if isinstance(value, torch.Tensor) and len(value.shape) == 2:
+                    W = value.numpy()
+                    logger.info(f"Using matrix from key: {key}")
+                    break
         
-        # Off-diagonal elements (set diagonal to 0)
-        offdiag = gram.copy()
-        np.fill_diagonal(offdiag, 0)
-        
-        metrics.update({
-            "whitening_diag_mean": float(np.mean(diag_vals)),
-            "whitening_diag_std": float(np.std(diag_vals)),
-            "whitening_offdiag_max": float(np.max(np.abs(offdiag))),
-            "whitening_offdiag_rms": float(np.sqrt(np.mean(offdiag**2))),
-            "whitening_matrix_shape": list(W.shape),
-        })
-        
-        logger.info(f"✅ Extracted whitening metrics: diag_mean={metrics['whitening_diag_mean']:.3f}")
+        if W is not None:
+            # Whitening matrix should satisfy W @ W.T ≈ I
+            gram = W @ W.T
+            diag_vals = np.diag(gram)
+            
+            # Off-diagonal elements (set diagonal to 0)
+            offdiag = gram.copy()
+            np.fill_diagonal(offdiag, 0)
+            
+            metrics.update({
+                "whitening_diag_mean": float(np.mean(diag_vals)),
+                "whitening_diag_std": float(np.std(diag_vals)),
+                "whitening_offdiag_max": float(np.max(np.abs(offdiag))),
+                "whitening_offdiag_rms": float(np.sqrt(np.mean(offdiag**2))),
+                "whitening_matrix_shape": list(W.shape),
+            })
+            
+            logger.info(f"✅ Extracted whitening metrics: diag_mean={metrics['whitening_diag_mean']:.3f}")
+        else:
+            logger.warning(f"Could not find whitening matrix in geometry file. Available keys: {list(geom_data.keys()) if isinstance(geom_data, dict) else 'N/A'}")
         
     except Exception as e:
         logger.warning(f"❌ Could not extract whitening metrics: {e}")
@@ -332,7 +357,7 @@ def main():
     logger.info(f"💾 Saved diagnostics to {output_file}")
     
     # Log to W&B
-    if not args.no_wandb:
+    if not args.no_wandb and WANDB_AVAILABLE:
         try:
             wandb.init(
                 project=args.project,
@@ -359,6 +384,8 @@ def main():
             
         except Exception as e:
             logger.error(f"❌ Failed to log to W&B: {e}")
+    elif not args.no_wandb:
+        logger.warning("⚠️ W&B not available - skipping W&B logging")
     
     # Print key results
     print("\n" + "="*60)
