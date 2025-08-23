@@ -68,6 +68,15 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+# Consistent styling
+COLORS = {"baseline": "#1f77b4", "teacher-init": "#ff7f0e"}  # blue, orange
+MARKERS = {"baseline": "o", "teacher-init": "s"}
+BETTER_LABELS = {
+    "1-EV": "(↓ better)", "1-CE": "(↓ better)", 
+    "leakage": "(↓ better)", "steering_leakage": "(↓ better)",
+    "purity": "(↑ better)", "angle_deg": "(↑ better)"
+}
+
 # Optional heavy deps – only imported when needed.
 try:
     import torch
@@ -384,36 +393,101 @@ def _collect_phase23_metrics(paths: Paths) -> Tuple[Optional[pd.DataFrame], Opti
 
 
 def fig5_purity_vs_leakage(paths: Paths):
-    """Fig. 5 — Purity vs. Leakage (baseline vs. teacher‑init)."""
+    """Fig. 5 — Purity vs. Leakage (baseline vs. teacher‑init) with arrows."""
     out = paths.out / "fig5_purity_vs_leakage.png"
     agg, per_parent = _collect_phase23_metrics(paths)
+    
+    # Use consistent colors and markers
+    
     if per_parent is not None and not per_parent.empty:
-        # Scatter per parent, overlay centroids
+        # Per-parent scatter with baseline→teacher arrows
+        plt.figure(figsize=(6.0, 5.0))
+        
+        # Pivot to get baseline and teacher values for each parent
+        piv = per_parent.pivot_table(index="parent_id", columns="run", values=["purity", "leakage"])
+        
+        # Check if we have both baseline and teacher data
+        if "baseline" in piv.columns.get_level_values(1) and "teacher-init" in piv.columns.get_level_values(1):
+            # Extract coordinates
+            baseline_purity = piv[("purity", "baseline")]
+            baseline_leakage = piv[("leakage", "baseline")]
+            teacher_purity = piv[("purity", "teacher-init")]
+            teacher_leakage = piv[("leakage", "teacher-init")]
+            
+            # Filter valid data points (both baseline and teacher exist, values in [0,1])
+            valid_mask = (
+                baseline_purity.notna() & baseline_leakage.notna() & 
+                teacher_purity.notna() & teacher_leakage.notna() &
+                (baseline_purity >= 0) & (baseline_purity <= 1) &
+                (baseline_leakage >= 0) & (baseline_leakage <= 1) &
+                (teacher_purity >= 0) & (teacher_purity <= 1) &
+                (teacher_leakage >= 0) & (teacher_leakage <= 1)
+            )
+            
+            if valid_mask.any():
+                # Plot baseline points
+                plt.scatter(baseline_leakage[valid_mask], baseline_purity[valid_mask], 
+                           color=COLORS["baseline"], alpha=0.7, s=60, label="Baseline", marker=MARKERS["baseline"])
+                
+                # Plot teacher points  
+                plt.scatter(teacher_leakage[valid_mask], teacher_purity[valid_mask],
+                           color=COLORS["teacher-init"], alpha=0.7, s=60, label="Teacher-init", marker=MARKERS["teacher-init"])
+                
+                # Draw arrows baseline→teacher
+                for parent_id in valid_mask[valid_mask].index:
+                    x0, y0 = baseline_leakage[parent_id], baseline_purity[parent_id]
+                    x1, y1 = teacher_leakage[parent_id], teacher_purity[parent_id]
+                    plt.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                               arrowprops=dict(arrowstyle="->", color="gray", alpha=0.6, lw=1))
+                
+                plt.xlabel("Leakage (↓ better)")
+                plt.ylabel("Purity (↑ better)")
+                plt.title(f"Fig. 5 — Purity vs. Leakage (N={valid_mask.sum()} parents)\nArrows show Δ (teacher-init − baseline)")
+                plt.xlim(0, 1)
+                plt.ylim(0, 1)
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                _savefig(out)
+                print(f"[fig5] wrote {out} (per-parent with arrows)")
+                return
+            
+        # Fall back to separate scatter if pivot failed
+        plt.clf()
         plt.figure(figsize=(5.2, 4.2))
         for run, sub in per_parent.groupby("run"):
-            plt.scatter(sub["leakage"], sub["purity"], alpha=0.7, label=run)
-        # Overlay aggregates if available
-        if agg is not None and not agg.empty:
-            for _, r in agg.iterrows():
-                plt.scatter(r["leakage"], r["purity"], marker="X", s=100, label=f"{r['run']} (agg)")
-        plt.xlabel("Leakage ↓")
-        plt.ylabel("Purity ↑")
+            color = COLORS.get(run, "gray")
+            marker = MARKERS.get(run, "o")
+            plt.scatter(sub["leakage"], sub["purity"], alpha=0.7, color=color, 
+                       label=run.title(), marker=marker)
+        
+        plt.xlabel("Leakage (↓ better)")
+        plt.ylabel("Purity (↑ better)")
         plt.title("Fig. 5 — Per‑parent purity vs. leakage")
+        plt.xlim(0, 1)
+        plt.ylim(0, 1)
+        plt.grid(True, alpha=0.3)
         plt.legend()
         _savefig(out)
-        print(f"[fig5] wrote {out}")
+        print(f"[fig5] wrote {out} (per-parent scatter)")
+        
     elif agg is not None and not agg.empty:
-        # Only two aggregate points
+        # Aggregate-only fallback
         plt.figure(figsize=(4.6, 3.8))
         for _, r in agg.iterrows():
-            plt.scatter(r["leakage"], r["purity"], marker="o", s=80, label=r["run"])
-        plt.xlabel("Leakage ↓")
-        plt.ylabel("Purity ↑")
-        subtitle = "Note: per‑parent metrics unavailable; showing run‑level aggregates."
-        plt.title("Fig. 5 — Purity vs. Leakage\n" + subtitle)
+            color = COLORS.get(r["run"], "gray") 
+            marker = MARKERS.get(r["run"], "o")
+            plt.scatter(r["leakage"], r["purity"], marker=marker, s=100, 
+                       color=color, label=r["run"].title())
+        
+        plt.xlabel("Leakage (↓ better)")
+        plt.ylabel("Purity (↑ better)")
+        plt.title("Fig. 5 — Purity vs. Leakage\n(Aggregate metrics only)")
+        plt.xlim(0, 1)
+        plt.ylim(0, 1)
+        plt.grid(True, alpha=0.3)
         plt.legend()
         _savefig(out)
-        print(f"[fig5] wrote {out}")
+        print(f"[fig5] wrote {out} (aggregate only)")
     else:
         print("[fig5] Missing Phase‑2/3 results — skipping")
 
