@@ -142,9 +142,17 @@ class HSAETrainer:
 
         self._optimizer_step(loss_dict["total_loss"])
 
-        total_steps = self.config["training"].get("total_steps", 10000)
+        # Anneal router temperature with the correct schedule horizon
+        horizon = None
+        tcfg = self.config.get("training", {})
+        if "teacher_init" in tcfg:
+            a = int(tcfg["teacher_init"].get("stage_A", {}).get("steps", 0))
+            b = int(tcfg["teacher_init"].get("stage_B", {}).get("steps", 0))
+            horizon = max(1, a + b)
+        if horizon is None or horizon <= 1:
+            horizon = int(tcfg.get("baseline", {}).get("total_steps", tcfg.get("total_steps", 10000)))
         if hasattr(self.model, "update_router_temperature"):
-            self.model.update_router_temperature(self.step, total_steps)
+            self.model.update_router_temperature(self.step, horizon)
         if hasattr(self.model, "normalize_decoder_weights"):
             # Support both causal and euclidean normalization based on config
             normalize_mode = self.config.get("hsae", {}).get("normalize_decoder", "euclidean")

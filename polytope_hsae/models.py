@@ -315,14 +315,55 @@ class HierarchicalSAE(nn.Module):
                         break
                     sub = self.subspaces[i]
                     
-                    # Check dimensions before copying
-                    if (down_proj.shape == sub.down_projector.weight.shape and 
-                        up_proj.shape == sub.up_projector.weight.shape):
-                        sub.down_projector.weight.copy_(down_proj)
-                        sub.up_projector.weight.copy_(up_proj)
+                    # Expected shapes
+                    s, d = sub.down_projector.weight.shape  # [subspace_dim, input_dim]
+                    # If provided projectors match, copy directly
+                    if down_proj.shape == (s, d) and up_proj.shape == (d, s):
+                        sub.down_projector.weight.copy_(down_proj.to(sub.down_projector.weight.dtype))
+                        sub.up_projector.weight.copy_(up_proj.to(sub.up_projector.weight.dtype))
                     else:
-                        logger.warning(f"Projector {i} shape mismatch: expected down={sub.down_projector.weight.shape}, got {down_proj.shape}; expected up={sub.up_projector.weight.shape}, got {up_proj.shape}")
-                        logger.warning(f"Skipping projector seeding for parent {i}, keeping random initialization")
+                        # Attempt to pad/complete orthonormal basis when k < s
+                        try:
+                            # Provided shapes typically are [k,d] and [d,k]
+                            if down_proj.shape[1] == d and up_proj.shape[0] == d and down_proj.shape[0] == up_proj.shape[1]:
+                                k = int(down_proj.shape[0])
+                                k = min(k, s)
+                                V_k = up_proj[:, :k].to(torch.float32)  # [d,k]
+                                # Build orthonormal complement to reach s columns
+                                if k < s:
+                                    need = s - k
+                                    # Gram-Schmidt completion
+                                    Q = V_k.clone()
+                                    # Generate random candidates and orthonormalize
+                                    rng = torch.randn(d, need, dtype=torch.float32, device=Q.device)
+                                    comps = []
+                                    for j in range(need):
+                                        v = rng[:, j]
+                                        # Remove components along existing Q and comps
+                                        if Q.numel() > 0:
+                                            v = v - Q @ (Q.t() @ v)
+                                        if comps:
+                                            C = torch.stack(comps, dim=1)
+                                            v = v - C @ (C.t() @ v)
+                                        v = v / (v.norm() + 1e-8)
+                                        comps.append(v)
+                                    if comps:
+                                        C = torch.stack(comps, dim=1)
+                                        V_full = torch.cat([V_k, C], dim=1)  # [d,s]
+                                    else:
+                                        V_full = V_k
+                                else:
+                                    V_full = V_k[:, :s]
+                                # Set weights
+                                sub.down_projector.weight.copy_(V_full.t().to(sub.down_projector.weight.dtype))
+                                sub.up_projector.weight.copy_(V_full.to(sub.up_projector.weight.dtype))
+                                logger.info(f"Projector {i}: seeded {k}/{s} columns and completed basis")
+                            else:
+                                logger.warning(
+                                    f"Projector {i} incompatible shapes. Expected down ~[s,d]={s,d}, up ~[d,s]={d,s}; got {tuple(down_proj.shape)}, {tuple(up_proj.shape)}. Keeping random."
+                                )
+                        except Exception as e:
+                            logger.warning(f"Projector {i} basis completion failed: {e}. Keeping random initialization.")
 
             for i in range(self.config.n_parents):
                 sub = self.subspaces[i]

@@ -1,0 +1,74 @@
+# One-off Phase 3 parity config: match H-SAE capacity to Phase 1 parents (m_top=5)
+
+run:
+  seed: 123
+  device: cuda:0
+  notes: "Phase 3 parity run (m_top=5, no teacher noise)"
+
+model:
+  name: EleutherAI/pythia-410m
+  dtype: bf16
+  activation_hook: final_residual_pre_unembed
+
+data:
+  unit_norm: true
+
+logging:
+  save_dir: runs/v2_focused
+  phase_1_log: teacher_extraction        # reuse existing Phase 1 outputs
+  phase_3_log: teacher_init_hsae_parity  # write Phase 3 parity outputs here
+
+hsae:
+  m_top: 5               # match Phase 1 parent count
+  topk_parent: 1
+  subspace_dim: 32
+  m_low: 8
+  topk_child: 1
+  l1_parent: 2.0e-4
+  l1_child: 2.0e-4
+  biorth_lambda: 1.0e-4
+  causal_ortho_lambda: 2.0e-4
+  router_temp: {start: 5.0, end: 0.7}
+  top_level_beta: 0.3
+  use_tied_decoders_parent: false
+  use_tied_decoders_child: false
+  tie_projectors: false
+  use_decoder_bias: true
+  use_offdiag_biorth: false
+
+training:
+  batch_size_acts: 1024
+  lr: 2.5e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  l1_warmup_steps: 1000
+  val_every: 500
+
+  teacher_init:
+    total_steps: 5000
+    l1_warmup_steps: 4000
+    teacher_noise_deg: [0]     # clean teacher only for parity
+    stage_A:
+      freeze_decoder: true
+      steps: 500
+      enable_causal_ortho: true
+    stage_B:
+      freeze_decoder: false
+      steps: 4500
+      enable_causal_ortho: false
+      decoder_lr_mult: 1.0     # allow decoder to adapt fully
+
+eval:
+  targets:
+    median_angle_deg: 80
+    purity_improvement: 0.10
+    leakage_reduction: 0.20
+    reconstruction_parity: 0.05
+  assertions:
+    identity_ev_min: 0.99
+    identity_max_error_tol: 0.02
+    whiten_diag_tol: 0.02
+    whiten_offdiag_rms_max: 0.02
+
+wandb_project: polytope-hsae
+

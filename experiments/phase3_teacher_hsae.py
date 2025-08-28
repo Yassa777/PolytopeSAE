@@ -417,7 +417,13 @@ def _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry
     val_sample = val_sample[:100].to(device)  # Use first 100 samples
     
     # Test whiten → unwhiten identity
-    identity_results = geometry.test_linear_identity(val_sample)
+    # Optional identity test tolerance from config
+    id_tol = (
+        config.get("eval", {})
+        .get("assertions", {})
+        .get("identity_max_error_tol", 1e-2)
+    )
+    identity_results = geometry.test_linear_identity(val_sample, tolerance=float(id_tol))
     logger.info(f"🔍 Identity Test Results:")
     for key, value in identity_results.items():
         logger.info(f"  {key}: {value}")
