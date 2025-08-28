@@ -15,7 +15,7 @@ model:
   layers_probe: ["last"]  # Single late layer only
 
 data:
-  token_budget: 8_000_000  # Reduced for focused experiment
+  token_budget: 16_000_000  # Increased for stronger teacher & eval stability
   window_length: 128
   shard_size_tokens: 262_144
   source: "Wikipedia 20231101 + curated prompts"
@@ -27,9 +27,9 @@ dataloader:
 
 concepts:
   ontology: wordnet
-  parents: 5                     # Match Phase 1 actual extraction (dry run scale)
-  max_children_per_parent: 2     # Match what we actually extracted  
-  prompts_per_concept: 64        # Reduced from 128 to 64
+  parents: 16                    # Increase Phase 1 parents to match H-SAE m_top
+  max_children_per_parent: 8     # Increase to match H-SAE m_low
+  prompts_per_concept: 128       # More samples per concept for better LDA
   split: {train: 0.70, val: 0.15, test: 0.15}
 
 geometry:
