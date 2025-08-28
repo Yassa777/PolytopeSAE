@@ -399,6 +399,36 @@ def validate_geometry(
         threshold_degrees=config["eval"]["targets"]["median_angle_deg"],
     )
 
+    # Identity and whitening diagnostics
+    identity_test = {}
+    try:
+        # Build a small fp32 batch from captured activations
+        sample_list = []
+        for d in parent_activations.values():
+            sample_list.append(d["pos"][:16])
+            sample_list.append(d["neg"][:16])
+            if len(sample_list) >= 8:
+                break
+        for pdata in child_activations.values():
+            for d in pdata.values():
+                sample_list.append(d["pos"][:16])
+                sample_list.append(d["neg"][:16])
+                if len(sample_list) >= 16:
+                    break
+            if len(sample_list) >= 16:
+                break
+        if sample_list:
+            X = torch.cat(sample_list, dim=0).to(torch.float32)
+            identity_test = geometry.test_linear_identity(X)
+    except Exception as e:
+        logger.warning(f"Identity test failed: {e}")
+
+    try:
+        whiten_stats = geometry.whitening_invariant_stats()
+    except Exception as e:
+        logger.warning(f"Whitening invariant stats failed: {e}")
+        whiten_stats = {}
+
     # Handle ragged children per parent: compute per-parent, then aggregate
     all_angles = []
     for pid, pvec in parent_vectors.items():
@@ -518,6 +548,8 @@ def validate_geometry(
             "passes_threshold": orthogonality_results["median_angle_deg"]
             >= config["eval"]["targets"]["median_angle_deg"],
         },
+        "identity_test": identity_test,
+        "whitening_diagnostics": whiten_stats,
         "angle_statistics": {
             "median_angle_deg": angle_stats["median_angle_deg"].item(),
             "mean_angle_deg": angle_stats["mean_angle_deg"].item(),

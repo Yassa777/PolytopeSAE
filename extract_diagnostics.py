@@ -77,12 +77,22 @@ def extract_whitening_metrics(base_path: Path) -> Dict[str, Any]:
         
         # Handle different possible formats
         W = None
+        Sigma = None
         if hasattr(geom_data, 'W'):
             W = geom_data.W.numpy()
+            Sigma = getattr(geom_data, 'Sigma', None)
+            if isinstance(Sigma, torch.Tensor):
+                Sigma = Sigma.numpy()
         elif isinstance(geom_data, dict) and 'W' in geom_data:
-            W = geom_data['W'].numpy()
+            W = geom_data['W'].numpy() if isinstance(geom_data['W'], torch.Tensor) else geom_data['W']
+            S = geom_data.get('Sigma')
+            if isinstance(S, torch.Tensor):
+                Sigma = S.numpy()
         elif isinstance(geom_data, dict) and 'whitening_matrix' in geom_data:
-            W = geom_data['whitening_matrix'].numpy()
+            W = geom_data['whitening_matrix'].numpy() if isinstance(geom_data['whitening_matrix'], torch.Tensor) else geom_data['whitening_matrix']
+            S = geom_data.get('Sigma')
+            if isinstance(S, torch.Tensor):
+                Sigma = S.numpy()
         else:
             # Try to find any matrix-like object
             for key, value in geom_data.items() if isinstance(geom_data, dict) else []:
@@ -92,8 +102,11 @@ def extract_whitening_metrics(base_path: Path) -> Dict[str, Any]:
                     break
         
         if W is not None:
-            # Whitening matrix should satisfy W @ W.T ≈ I
-            gram = W @ W.T
+            # Whitening invariant should satisfy W Σ W^T ≈ I (default Σ=I if missing)
+            if Sigma is None:
+                logger.warning("Σ not found in geometry; assuming identity for diagnostics")
+                Sigma = np.eye(W.shape[0], dtype=W.dtype)
+            gram = W @ Sigma @ W.T
             diag_vals = np.diag(gram)
             
             # Off-diagonal elements (set diagonal to 0)
@@ -130,12 +143,16 @@ def extract_identity_metrics(base_path: Path) -> Dict[str, Any]:
         identity = val_results.get("identity_test", {})
         validation = val_results.get("orthogonality_validation", {})
         
-        metrics.update({
-            "identity_ev": safe_get(identity, "explained_variance", default=-999),
-            "identity_mse": safe_get(identity, "mse", default=9999),
-            "identity_max_error": safe_get(identity, "max_error", default=9999),
-            "geometry_validation_passes": safe_get(val_results, "passes_validation", default=False),
-        })
+        ev_val = safe_get(identity, "explained_variance", default=None)
+        mse_val = safe_get(identity, "mse", default=None)
+        max_err = safe_get(identity, "max_error", default=None)
+        if ev_val is not None:
+            metrics["identity_ev"] = float(ev_val)
+        if mse_val is not None:
+            metrics["identity_mse"] = float(mse_val)
+        if max_err is not None:
+            metrics["identity_max_error"] = float(max_err)
+        metrics["geometry_validation_passes"] = bool(val_results.get("passes_validation", False))
         
         logger.info(f"✅ Extracted identity metrics: EV={metrics['identity_ev']}")
         
@@ -288,8 +305,8 @@ def create_diagnostic_verdicts(metrics: Dict[str, Any]) -> Dict[str, str]:
     verdicts["whitening_offdiag"] = "PASS" if offdiag_max <= 0.05 else "FAIL"
     
     # Identity checks
-    identity_ev = metrics.get("identity_ev", -999)
-    verdicts["identity_ev"] = "PASS" if identity_ev >= 0.95 else "FAIL"
+    identity_ev = metrics.get("identity_ev", None)
+    verdicts["identity_ev"] = "PASS" if (identity_ev is not None and identity_ev >= 0.95) else "FAIL"
     
     # Reconstruction checks
     baseline_ev = metrics.get("baseline_recon_ev", 0)

@@ -27,13 +27,19 @@ def compute_explained_variance(x: torch.Tensor, x_hat: torch.Tensor) -> float:
     Returns:
         Explained variance (higher is better)
     """
-    x_mean = torch.mean(x, dim=0, keepdim=True)
+    # Always compute in float32 for numerical stability
+    xf = x.detach().to(torch.float32)
+    xhf = x_hat.detach().to(torch.float32)
+    x_mean = torch.mean(xf, dim=0, keepdim=True)
 
-    numerator = torch.sum((x - x_hat) ** 2)
-    denominator = torch.sum((x - x_mean) ** 2)
+    numerator = torch.sum((xf - xhf) ** 2)
+    denominator = torch.sum((xf - x_mean) ** 2)
 
     ev = 1.0 - (numerator / (denominator + 1e-8))
-    return ev.item()
+    ev_val = ev.item()
+    if not np.isfinite(ev_val):
+        raise FloatingPointError("compute_explained_variance produced non-finite value")
+    return ev_val
 
 
 def compute_logit_ev(x: torch.Tensor, x_hat: torch.Tensor, unembedding: torch.Tensor) -> float:
@@ -49,16 +55,22 @@ def compute_logit_ev(x: torch.Tensor, x_hat: torch.Tensor, unembedding: torch.Te
     Returns:
         Logit-space explained variance (higher is better)
     """
-    # Project to logit space
-    X = x @ unembedding.T  # [batch_size, vocab_size]
-    X_hat = x_hat @ unembedding.T  # [batch_size, vocab_size]
+    # Project to logit space in float32
+    xf = x.detach().to(torch.float32)
+    xhf = x_hat.detach().to(torch.float32)
+    Uf = unembedding.detach().to(torch.float32)
+    X = xf @ Uf.T  # [batch_size, vocab_size]
+    X_hat = xhf @ Uf.T  # [batch_size, vocab_size]
     X_mean = X.mean(dim=0, keepdim=True)
 
     numerator = torch.sum((X - X_hat) ** 2)
     denominator = torch.sum((X - X_mean) ** 2)
 
     ev_logit = 1.0 - (numerator / (denominator + 1e-8))
-    return ev_logit.item()
+    ev_val = ev_logit.item()
+    if not np.isfinite(ev_val):
+        raise FloatingPointError("compute_logit_ev produced non-finite value")
+    return ev_val
 
 
 def compute_dual_explained_variance(
@@ -82,11 +94,13 @@ def compute_dual_explained_variance(
     results = {}
     
     # 1. STANDARD EV (PRIMARY) - apples-to-apples with flat SAEs
-    x_mean = torch.mean(x, dim=0, keepdim=True)
-    mse_standard = torch.sum((x - x_hat) ** 2)
-    var_standard = torch.sum((x - x_mean) ** 2)
+    xf = x.detach().to(torch.float32)
+    xhf = x_hat.detach().to(torch.float32)
+    x_mean = torch.mean(xf, dim=0, keepdim=True)
+    mse_standard = torch.sum((xf - xhf) ** 2)
+    var_standard = torch.sum((xf - x_mean) ** 2)
     ev_standard = 1.0 - (mse_standard / (var_standard + 1e-8))
-    results['standard_ev'] = ev_standard.item()
+    results['standard_ev'] = float(ev_standard.item())
     
     if print_components:
         logger.info(f"📊 STANDARD EV (Primary - comparable to flat SAEs):")
@@ -97,14 +111,14 @@ def compute_dual_explained_variance(
     # 2. GEOMETRY-AWARE EV (SECONDARY) - Mahalanobis metric
     if geometry is not None:
         # Whiten both x and x_hat, then compute EV in causal space
-        x_whitened = geometry.whiten(x)
-        x_hat_whitened = geometry.whiten(x_hat)
+        x_whitened = geometry.whiten(xf)
+        x_hat_whitened = geometry.whiten(xhf)
         x_mean_whitened = torch.mean(x_whitened, dim=0, keepdim=True)
         
         mse_causal = torch.sum((x_whitened - x_hat_whitened) ** 2)
         var_causal = torch.sum((x_whitened - x_mean_whitened) ** 2)
         ev_causal = 1.0 - (mse_causal / (var_causal + 1e-8))
-        results['causal_ev'] = ev_causal.item()
+        results['causal_ev'] = float(ev_causal.item())
         
         if print_components:
             logger.info(f"📊 CAUSAL EV (Secondary - Mahalanobis metric):")
@@ -130,12 +144,30 @@ def compute_cross_entropy_proxy(
         Cross-entropy proxy (lower is better)
     """
     # Normalize to probabilities
-    p_true = F.softmax(x / temperature, dim=-1)
-    log_p_pred = F.log_softmax(x_hat / temperature, dim=-1)
-
-    # Cross-entropy
-    ce = -torch.sum(p_true * log_p_pred, dim=-1).mean()
-    return ce.item()
+    # Compute in float32 for numerical stability
+    xf = x.detach().to(torch.float32)
+    xhf = x_hat.detach().to(torch.float32)
+    # Compute via CE(P,Q) = logsumexp(z) - dot(P, z)
+    tau = float(temperature)
+    if x.dtype == torch.bfloat16 or x_hat.dtype == torch.bfloat16:
+        # Preserve strict shift invariance behaviour under bf16 rounding by staying in native dtype
+        xb = x.to(torch.bfloat16)
+        xhb = x_hat.to(torch.bfloat16)
+        p_true_b = F.softmax(xb / tau, dim=-1)
+        z_b = xhb / tau
+        lse_b = torch.logsumexp(z_b, dim=-1)
+        dot_b = torch.sum(p_true_b * z_b, dim=-1)
+        ce = (lse_b - dot_b).mean().to(torch.float32)
+    else:
+        p_true = F.softmax(xf / tau, dim=-1)
+        z = xhf / tau
+        lse = torch.logsumexp(z, dim=-1)
+        dot = torch.sum(p_true * z, dim=-1)
+        ce = (lse - dot).mean()
+    ce_val = ce.item()
+    if not np.isfinite(ce_val):
+        raise FloatingPointError("compute_cross_entropy_proxy produced non-finite value")
+    return ce_val
 
 
 def compute_purity_metrics(
@@ -425,7 +457,7 @@ def compute_comprehensive_metrics(
             # Forward pass
             x_hat, (parent_codes, child_codes), model_metrics = model(batch_data)
 
-            # Basic reconstruction metrics
+            # Basic reconstruction metrics (compute EV once; derive 1-EV)
             ev = compute_explained_variance(batch_data, x_hat)
             ce_proxy = compute_cross_entropy_proxy(batch_data, x_hat)
 
@@ -447,6 +479,7 @@ def compute_comprehensive_metrics(
 
             # Combine all metrics
             batch_metrics = {
+                "EV": ev,
                 "1-EV": 1.0 - ev,
                 "1-CE": ce_proxy,
                 **leakage_metrics,
@@ -461,7 +494,7 @@ def compute_comprehensive_metrics(
             all_metrics.append(batch_metrics)
 
     # Average across batches
-    final_metrics = {}
+    final_metrics: Dict[str, float] = {}
     if all_metrics:
         for key in all_metrics[0].keys():
             # Convert values to float to handle bools and check for NaN
@@ -479,6 +512,11 @@ def compute_comprehensive_metrics(
             if float_values:
                 final_metrics[key] = np.mean(float_values)
                 final_metrics[f"{key}_std"] = np.std(float_values)
+
+    # If both EV and 1-EV present, ensure consistency and prefer to keep both
+    if "EV" in final_metrics and "1-EV" in final_metrics:
+        # Derive 1-EV from EV to avoid double conversion drift
+        final_metrics["1-EV"] = 1.0 - final_metrics["EV"]
 
     return final_metrics
 

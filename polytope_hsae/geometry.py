@@ -51,6 +51,14 @@ class CausalGeometry:
         # Compute whitening matrix
         self.Sigma, self.W = self._compute_whitening_matrix()
 
+        # Optional: quick invariant check (non-fatal here). Detailed checks can be run explicitly.
+        try:
+            stats = self.whitening_invariant_stats()
+            if not torch.isfinite(torch.tensor(list(stats.values()), dtype=torch.float32)).all():
+                logger.warning("Whitening invariant produced non-finite stats; check inputs")
+        except Exception as e:
+            logger.debug(f"Whitening invariant quick-check skipped: {e}")
+
     @classmethod
     def from_unembedding(cls, U, shrinkage=0.05):
         """Create geometry from unembedding matrix (standard approach)."""
@@ -211,10 +219,11 @@ class CausalGeometry:
         """Apply whitening transformation: x̃ = Wx."""
         if x.ndim not in (1, 2):
             raise ValueError("whiten expects a 1D or 2D tensor")
-        W = self.W.to(
-            x.device, dtype=x.dtype if x.dtype.is_floating_point else torch.float32
-        )
-        return x @ W.T
+        # Always compute in float32 to reduce bf16/half overflow/underflow
+        W = self.W.to(x.device, dtype=torch.float32)
+        xf = x.to(torch.float32)
+        out = xf @ W.T
+        return out.to(x.dtype)
 
     def unwhiten(self, x_whitened: torch.Tensor) -> torch.Tensor:
         """Apply inverse whitening transformation: x = x̃W^{-1}."""
@@ -291,6 +300,29 @@ class CausalGeometry:
         self.Sigma = self.Sigma.to(device)
         return self
 
+    def whitening_invariant_stats(self) -> Dict[str, float]:
+        """
+        Compute diagnostics for whitening invariant: C = W Σ W^T ≈ I.
+
+        Returns:
+            Dict with diag mean/std, off-diag max/rms, and Frobenius norm error.
+        """
+        W = self.W.detach().to(torch.float32).cpu()
+        Sigma = self.Sigma.detach().to(torch.float32).cpu()
+        I = torch.eye(W.shape[0], dtype=torch.float32)
+        C = W @ Sigma @ W.T
+        E = C - I
+        diag = torch.diag(C)
+        off = C - torch.diag(diag)
+        stats = {
+            "whiten_diag_mean": float(diag.mean().item()),
+            "whiten_diag_std": float(diag.std().item()),
+            "whiten_offdiag_max": float(off.abs().max().item()),
+            "whiten_offdiag_rms": float(torch.sqrt((off**2).mean()).item()),
+            "whiten_fro_error": float(torch.linalg.norm(E, ord="fro").item()),
+        }
+        return stats
+
     def test_linear_identity(self, x: torch.Tensor, tolerance: float = 1e-4) -> Dict[str, float]:
         """
         Test linear identity: x → whiten → unwhiten → should equal x.
@@ -302,26 +334,38 @@ class CausalGeometry:
         Returns:
             Dictionary with identity test metrics
         """
-        x_whitened = self.whiten(x)
+        # Force fp32 for stability
+        xf = x.detach().to(torch.float32)
+        x_whitened = self.whiten(xf)
         x_reconstructed = self.unwhiten(x_whitened)
         
         # Compute reconstruction error
-        mse = torch.mean((x - x_reconstructed) ** 2).item()
-        max_error = torch.max(torch.abs(x - x_reconstructed)).item()
+        err = (xf - x_reconstructed.to(torch.float32))
+        mse = torch.mean(err ** 2).item()
+        max_error = torch.max(torch.abs(err)).item()
         
         # Compute explained variance (should be ~1.0)
         from polytope_hsae.metrics import compute_explained_variance
-        identity_ev = compute_explained_variance(x, x_reconstructed)
+        identity_ev = compute_explained_variance(xf, x_reconstructed.to(torch.float32))
         
         # Check if identity holds within tolerance
         identity_ok = max_error < tolerance
-        
+        # Assert finite
+        if not np.isfinite([mse, max_error, identity_ev]).all():
+            raise FloatingPointError("Non-finite values in linear identity test")
+
+        # Return both verbose and compact field names for downstream compatibility
         return {
             "identity_mse": mse,
             "identity_max_error": max_error,
             "identity_ev": identity_ev,
             "identity_ok": identity_ok,
-            "tolerance": tolerance
+            "tolerance": float(tolerance),
+            # Canonical names for diagnostics extractors
+            "mse": mse,
+            "max_error": max_error,
+            "explained_variance": identity_ev,
+            "ok": identity_ok,
         }
 
     def project_causal(self, x: torch.Tensor, onto: torch.Tensor) -> torch.Tensor:

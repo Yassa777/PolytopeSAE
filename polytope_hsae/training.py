@@ -129,7 +129,15 @@ class HSAETrainer:
             else contextlib.nullcontext()
         )
         with autocast_ctx:
-            x_hat, (parent_codes, _), metrics = self.model(x)
+            x_hat, (parent_codes, child_codes), metrics = self.model(x)
+            # NaN/Inf guards on forward outputs
+            for name, t in {
+                "x_hat": x_hat,
+                "parent_codes": parent_codes,
+                "child_codes": child_codes,
+            }.items():
+                if not torch.isfinite(t).all():
+                    raise FloatingPointError(f"Non-finite values in {name} during forward")
             loss_dict = self._compute_total_loss(x, x_hat, metrics, stage, parent_codes)
 
         self._optimizer_step(loss_dict["total_loss"])
@@ -151,8 +159,43 @@ class HSAETrainer:
             ev = compute_explained_variance(x, x_hat)
             ce_proxy = compute_cross_entropy_proxy(x, x_hat)
 
+            # Dictionary health diagnostics (quick stats)
+            pd = self.model.router.decoder.weight if not self.model.config.use_tied_decoders_parent else self.model.router.encoder.weight.T
+            pdn = pd / (pd.norm(dim=0, keepdim=True) + 1e-8)
+            Pcos = (pdn.T @ pdn)
+            Poff = Pcos - torch.diag(torch.diag(Pcos))
+            parent_cos_median = torch.median(Poff.abs()).item() if Poff.numel() > 0 else 0.0
+            parent_cos_p95 = torch.quantile(Poff.abs().reshape(-1), 0.95).item() if Poff.numel() > 0 else 0.0
+            parent_norm_median = torch.median(pd.norm(dim=0)).item()
+            # Child stats aggregated
+            child_norms = []
+            child_offabs = []
+            for sub in self.model.subspaces:
+                cd = sub.decoder.weight if not self.model.config.use_tied_decoders_child else sub.encoder.weight.T
+                cdn = cd / (cd.norm(dim=0, keepdim=True) + 1e-8)
+                Ccos = (cdn.T @ cdn)
+                Coff = Ccos - torch.diag(torch.diag(Ccos))
+                if Coff.numel() > 0:
+                    child_offabs.append(Coff.abs().reshape(-1))
+                child_norms.append(cd.norm(dim=0))
+            child_norms_cat = torch.cat(child_norms) if child_norms else torch.zeros(1, device=x.device)
+            child_offabs_cat = torch.cat(child_offabs) if child_offabs else torch.zeros(1, device=x.device)
+            child_cos_median = torch.median(child_offabs_cat).item()
+            child_cos_p95 = torch.quantile(child_offabs_cat, 0.95).item()
+            child_norm_median = torch.median(child_norms_cat).item()
+
+            # L0 and dead-feature counts within batch
+            l0_parents = torch.sum(parent_codes > 0, dim=1).float().mean().item()
+            l0_children = torch.sum(child_codes > 0, dim=(1, 2)).float().mean().item()
+            dead_parents = (torch.sum(parent_codes > 0, dim=0) == 0).sum().item()
+            dead_children = (torch.sum(child_codes > 0, dim=(0, 1)) == 0).sum().item()
+            # Activation distribution summaries (stand-in for histograms)
+            parent_code_p95 = torch.quantile(parent_codes[parent_codes>0].flatten(), 0.95).item() if (parent_codes>0).any() else 0.0
+            child_code_p95 = torch.quantile(child_codes[child_codes>0].flatten(), 0.95).item() if (child_codes>0).any() else 0.0
+
         log_metrics = {
             **loss_dict,
+            "EV": ev,
             "1-EV": 1.0 - ev,
             "1-CE": ce_proxy,
             "parent_sparsity": metrics["parent_sparsity"],
@@ -162,6 +205,21 @@ class HSAETrainer:
             "router_temperature": metrics["router_temperature"],
             "l1_multiplier": self._get_l1_multiplier(self.step),
             "lr": self.optimizer.param_groups[0]["lr"],
+            # Usage visibility
+            "l0_parents_per_token": l0_parents,
+            "l0_children_per_token": l0_children,
+            "dead_parent_features": float(dead_parents),
+            "dead_child_features": float(dead_children),
+            # Dictionary health
+            "parent_decoder_norm_median": parent_norm_median,
+            "parent_decoder_cos_median": parent_cos_median,
+            "parent_decoder_cos_p95": parent_cos_p95,
+            "child_decoder_norm_median": child_norm_median,
+            "child_decoder_cos_median": child_cos_median,
+            "child_decoder_cos_p95": child_cos_p95,
+            # Activation summary
+            "parent_code_p95": parent_code_p95,
+            "child_code_p95": child_code_p95,
         }
         return {k: (v.item() if torch.is_tensor(v) else float(v)) for k, v in log_metrics.items()}
 
@@ -293,6 +351,7 @@ class HSAETrainer:
                 {
                     "Loss": f"{metrics['total_loss']:.4f}",
                     "1-EV": f"{metrics['1-EV']:.4f}",
+                    "τ": f"{metrics.get('router_temperature', 0.0):.2f}",
                     "L1": f"{metrics.get('l1_multiplier', 1.0):.2f}",
                 }
             )
@@ -490,6 +549,7 @@ class HSAETrainer:
                     {
                         "total_loss": total_loss.item(),
                         "recon_loss": recon_loss.item(),
+                        "EV": ev,
                         "1-EV": 1.0 - ev,
                         "1-CE": ce_proxy,
                         "parent_sparsity": metrics["parent_sparsity"].item(),
@@ -504,6 +564,7 @@ class HSAETrainer:
             return {
                 "total_loss": float('inf'),
                 "recon_loss": float('inf'),
+                "EV": 0.0,
                 "1-EV": 1.0,
                 "1-CE": float('inf'),
                 "parent_sparsity": 0.0,
@@ -666,9 +727,12 @@ def create_data_loader(
     if drop_last is None:
         drop_last = len(ds) >= batch_size  # only drop when we have >=1 full batch
 
+    # Auto-clamp batch size to dataset length to avoid zero-batch loaders
+    effective_bs = min(batch_size, len(ds)) if len(ds) > 0 else batch_size
+
     loader = DataLoader(
         ds,
-        batch_size=batch_size,
+        batch_size=effective_bs,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,

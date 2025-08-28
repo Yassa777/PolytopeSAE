@@ -434,7 +434,12 @@ def _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry
         logger.info("✅ Comprehensive metrics computed successfully")
         
         # Log key metrics with detailed EV breakdown
-        final_ev = 1.0 - final_metrics.get('1-EV', 1.0)
+        # Add EV explicitly and ensure 1-EV is consistent
+        if 'EV' not in final_metrics and '1-EV' in final_metrics:
+            final_metrics['EV'] = 1.0 - float(final_metrics['1-EV'])
+        elif 'EV' in final_metrics:
+            final_metrics['1-EV'] = 1.0 - float(final_metrics['EV'])
+        final_ev = float(final_metrics.get('EV', 1.0 - final_metrics.get('1-EV', 1.0)))
         logger.info(f"📊 FINAL METRICS BREAKDOWN:")
         logger.info(f"  EV (Explained Variance): {final_ev:.4f}")
         logger.info(f"  CE proxy: {final_metrics.get('1-CE', 0.0):.4f}")
@@ -487,8 +492,10 @@ def _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry
                 total_ce += ce
                 n_batches += 1
         
+        ev_mean = (total_ev / n_batches)
         final_metrics = {
-            "1-EV": 1.0 - (total_ev / n_batches),
+            "EV": ev_mean,
+            "1-EV": 1.0 - ev_mean,
             "1-CE": total_ce / n_batches,
             "parent_sparsity": torch.mean((parent_codes > 0).float()).item(),
             "child_sparsity": torch.mean((child_codes > 0).float()).item(),
@@ -534,7 +541,7 @@ def _train_teacher_hsae_single_attempt(model, dataset, config, exp_dir, geometry
                 wandb_metrics[f"final/{key}"] = value
         
         # Also log the key summary metrics
-        ev = 1.0 - final_metrics.get("1-EV", 1.0)
+        ev = float(final_metrics.get("EV", 1.0 - final_metrics.get("1-EV", 1.0)))
         wandb_metrics.update({
             "final/explained_variance": ev,
             "final/cross_entropy_proxy": final_metrics.get("1-CE", 0.0),
