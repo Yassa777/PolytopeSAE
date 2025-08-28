@@ -571,6 +571,27 @@ def validate_geometry(
         ),
     }
 
+    # Optional assertions (fail-fast) controlled by config
+    try:
+        assertions = config.get("eval", {}).get("assertions", {})
+        if assertions:
+            # Identity EV minimum
+            id_ev_min = float(assertions.get("identity_ev_min", 0.98))
+            if identity_test and isinstance(identity_test.get("identity_ev", None), (int, float)):
+                assert identity_test["identity_ev"] >= id_ev_min, f"Identity EV {identity_test['identity_ev']:.6f} < {id_ev_min}"
+
+            # Whitening tolerance
+            diag_tol = float(assertions.get("whiten_diag_tol", 0.05))  # |mean-1| <= tol
+            off_rms_max = float(assertions.get("whiten_offdiag_rms_max", 0.05))
+            if whiten_stats:
+                diag_mean = float(whiten_stats.get("whiten_diag_mean", 1.0))
+                off_rms = float(whiten_stats.get("whiten_offdiag_rms", 0.0))
+                assert abs(diag_mean - 1.0) <= diag_tol, f"Whitening diag mean {diag_mean:.4f} out of tol ±{diag_tol}"
+                assert off_rms <= off_rms_max, f"Whitening offdiag RMS {off_rms:.4f} > {off_rms_max}"
+    except AssertionError as e:
+        logger.error(f"❌ Geometry assertions failed: {e}")
+        validation_results["passes_validation"] = False
+
     # Save validation results
     with open(exp_dir / "validation_results.json", "w") as f:
         json.dump(validation_results, f, indent=2, default=str)

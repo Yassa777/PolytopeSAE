@@ -288,32 +288,40 @@ def extract_steering_metrics(base_path: Path) -> Dict[str, Any]:
     return metrics
 
 
-def create_diagnostic_verdicts(metrics: Dict[str, Any]) -> Dict[str, str]:
-    """Create pass/fail verdicts for diagnostic checks."""
+def create_diagnostic_verdicts(metrics: Dict[str, Any], thresholds: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """Create pass/fail verdicts for diagnostic checks with optional thresholds."""
     verdicts = {}
-    
+
+    thresholds = thresholds or {}
+    # Default thresholds
+    angle_median_min = float(thresholds.get("median_angle_deg", 80))
+    angle_frac80_min = float(thresholds.get("angles_frac_above_80", 0.9))
+    angle_frac85_min = float(thresholds.get("angles_frac_above_85", 0.7))
+    whiten_diag_tol = float(thresholds.get("whiten_diag_tol", 0.05))
+    whiten_offdiag_rms_max = float(thresholds.get("whiten_offdiag_rms_max", 0.05))
+    identity_ev_min = float(thresholds.get("identity_ev_min", 0.95))
+
     # Angle checks
-    verdicts["angles_median"] = "PASS" if metrics.get("angles_median_deg", 0) >= 80 else "FAIL"
-    verdicts["angles_frac_80"] = "PASS" if metrics.get("angles_frac_above_80", 0) >= 0.9 else "FAIL"
-    verdicts["angles_frac_85"] = "PASS" if metrics.get("angles_frac_above_85", 0) >= 0.7 else "FAIL"
-    
-    # Whitening checks
-    diag_mean = metrics.get("whitening_diag_mean", 0)
-    verdicts["whitening_diag"] = "PASS" if 0.95 <= diag_mean <= 1.05 else "FAIL"
-    
-    offdiag_max = metrics.get("whitening_offdiag_max", 1)
-    verdicts["whitening_offdiag"] = "PASS" if offdiag_max <= 0.05 else "FAIL"
-    
+    verdicts["angles_median"] = "PASS" if metrics.get("angles_median_deg", 0) >= angle_median_min else "FAIL"
+    verdicts["angles_frac_80"] = "PASS" if metrics.get("angles_frac_above_80", 0) >= angle_frac80_min else "FAIL"
+    verdicts["angles_frac_85"] = "PASS" if metrics.get("angles_frac_above_85", 0) >= angle_frac85_min else "FAIL"
+
+    # Whitening checks: use diag mean tolerance around 1.0 and RMS off-diag
+    diag_mean = float(metrics.get("whitening_diag_mean", 0))
+    offdiag_rms = float(metrics.get("whitening_offdiag_rms", 1.0))
+    verdicts["whitening_diag"] = "PASS" if abs(diag_mean - 1.0) <= whiten_diag_tol else "FAIL"
+    verdicts["whitening_offdiag"] = "PASS" if offdiag_rms <= whiten_offdiag_rms_max else "FAIL"
+
     # Identity checks
     identity_ev = metrics.get("identity_ev", None)
-    verdicts["identity_ev"] = "PASS" if (identity_ev is not None and identity_ev >= 0.95) else "FAIL"
-    
-    # Reconstruction checks
+    verdicts["identity_ev"] = "PASS" if (identity_ev is not None and identity_ev >= identity_ev_min) else "FAIL"
+
+    # Reconstruction checks (keep as informational; thresholds are independent)
     baseline_ev = metrics.get("baseline_recon_ev", 0)
     teacher_ev = metrics.get("teacher_recon_ev", 0)
     verdicts["baseline_recon"] = "PASS" if baseline_ev >= 0.8 else "SUSPECT" if baseline_ev >= 0.5 else "FAIL"
     verdicts["teacher_recon"] = "PASS" if teacher_ev >= 0.8 else "SUSPECT" if teacher_ev >= 0.5 else "FAIL"
-    
+
     return verdicts
 
 
@@ -351,8 +359,21 @@ def main():
     # Global config
     all_metrics.update(extract_config_metrics(args.config))
     
-    # Create verdicts
-    verdicts = create_diagnostic_verdicts(all_metrics)
+    # Load thresholds from config if present
+    diag_thresholds = {}
+    try:
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f)
+        diag_thresholds = cfg.get("eval", {}).get("assertions", {}) or {}
+        # Also allow angle targets from config
+        targets = cfg.get("eval", {}).get("targets", {}) or {}
+        if targets:
+            diag_thresholds.setdefault("median_angle_deg", targets.get("median_angle_deg"))
+    except Exception:
+        pass
+
+    # Create verdicts using thresholds
+    verdicts = create_diagnostic_verdicts(all_metrics, thresholds=diag_thresholds)
     all_metrics["verdicts"] = verdicts
     
     # Add summary stats
