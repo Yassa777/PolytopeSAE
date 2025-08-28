@@ -740,9 +740,40 @@ def main():
     logger.info(f"Results saved to: {exp_dir}")
     logger.info("🔄 Ready for Phase 4 evaluation and comparison")
 
-    success = True  # Always successful if training completes
+    # Phase 3 Success Gate (informational): reconstruction parity + purity/leakage targets
+    try:
+        targets = config.get("eval", {}).get("targets", {})
+        purity_target = float(targets.get("purity_improvement", 0.10))  # +10pp
+        leakage_target = float(targets.get("leakage_reduction", 0.20))  # -20%
+        recon_parity = float(targets.get("reconstruction_parity", 0.05)) # ≤ 5pp 1-EV diff
 
-    return success
+        # Extract numbers from comparison if available
+        purity_impr = comparison.get("purity", {}).get("purity_improvement", 0.0)
+        leakage_red = comparison.get("leakage", {}).get("leakage_reduction", 0.0)
+        ev_diff = abs(comparison.get("reconstruction", {}).get("ev_difference", 1.0))
+
+        conds = {
+            "purity_ok": (purity_impr >= purity_target),
+            "leakage_ok": (leakage_red >= leakage_target),
+            "recon_parity_ok": (ev_diff <= recon_parity),
+        }
+
+        logger.info("=" * 50)
+        logger.info("PHASE 3 SUCCESS GATE (informational)")
+        logger.info("=" * 50)
+        logger.info(f"Purity +≥{purity_target*100:.0f}pp: {'PASS' if conds['purity_ok'] else 'FAIL'} (Δ={purity_impr*100:.1f}pp)")
+        logger.info(f"Leakage −≥{leakage_target*100:.0f}%: {'PASS' if conds['leakage_ok'] else 'FAIL'} (Δ={leakage_red*100:.1f}%)")
+        logger.info(f"Reconstruction parity ≤{recon_parity*100:.0f}pp: {'PASS' if conds['recon_parity_ok'] else 'FAIL'} (Δ={ev_diff*100:.1f}pp)")
+        overall = all(conds.values())
+        logger.info(f"Overall: {'PASS' if overall else 'FAIL'}")
+        results.setdefault("success_gate", {})["phase3"] = {**conds, "overall": overall,
+                                                            "purity_improvement": purity_impr,
+                                                            "leakage_reduction": leakage_red,
+                                                            "ev_difference": ev_diff}
+    except Exception as e:
+        logger.warning(f"Could not compute Phase 3 success gate: {e}")
+
+    return True
 
 
 if __name__ == "__main__":

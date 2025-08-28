@@ -470,6 +470,21 @@ def run_steering_experiments(
                 # Use some parent prompts as test prompts
                 test_prompts[parent_id] = hierarchy.parent_prompts[:3]
 
+        # Smoke test: ensure intervention changes logits
+        try:
+            if test_prompts:
+                any_parent = next(iter(test_prompts.keys()))
+                pv = parent_vectors[any_parent]
+                sample_prompts = test_prompts[any_parent][:1]
+                test_result = steering.steer_with_parent_vector(sample_prompts, pv, magnitude=1.0)
+                mad = torch.mean(torch.abs(test_result["logit_deltas"]))
+                if not torch.isfinite(mad) or mad.item() < 1e-6:
+                    logger.warning(f"Steering smoke test very small/zero (mean |Δlogits|={mad.item():.3e}); check hook path and slice")
+                else:
+                    logger.info(f"Steering smoke test passed (mean |Δlogits|={mad.item():.3e})")
+        except Exception as e:
+            logger.warning(f"Steering smoke test failed: {e}")
+
         # Run steering suite
         if test_prompts and parent_vectors:
             suite_results = steering.run_steering_suite(

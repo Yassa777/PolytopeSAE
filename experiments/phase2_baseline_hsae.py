@@ -410,6 +410,89 @@ def _train_baseline_hsae_single_attempt(model, dataset, config, exp_dir, attempt
         },
     }
 
+    # Phase 2 Success Gate (informational): quick PASS/FAIL summary
+    try:
+        ev_target = float(config.get("eval", {}).get("ev_target", 0.95))
+        parent_cos_p95_max = float(config.get("eval", {}).get("parent_cos_p95_max", 0.20))
+        child_cos_p95_max = float(config.get("eval", {}).get("child_cos_p95_max", 0.30))
+        temp_end = float(config.get("hsae", {}).get("router_temp", {}).get("end", 0.7))
+        temp_tol = float(config.get("eval", {}).get("tau_tolerance", 0.15))
+
+        # Pull EV
+        final_ev_val = float(final_metrics.get("EV", 1.0 - final_metrics.get("1-EV", 1.0)))
+
+        # Compute dictionary health and routing usage on one validation batch
+        model.eval()
+        with torch.no_grad():
+            vbatch = next(iter(val_loader))
+            if isinstance(vbatch, (list, tuple)):
+                vbatch = vbatch[0]
+            vbatch = vbatch.to(device)
+            x_hat, (parent_codes, child_codes), m = model(vbatch)
+
+            # Decoder health (cos p95)
+            pd = model.router.decoder.weight if not model.config.use_tied_decoders_parent else model.router.encoder.weight.T
+            pdn = pd / (pd.norm(dim=0, keepdim=True) + 1e-8)
+            Pcos = pdn.T @ pdn
+            Poff = (Pcos - torch.diag(torch.diag(Pcos))).abs().reshape(-1)
+            parent_cos_p95 = torch.quantile(Poff, 0.95).item() if Poff.numel() > 0 else 0.0
+
+            child_off = []
+            for sub in model.subspaces:
+                cd = sub.decoder.weight if not model.config.use_tied_decoders_child else sub.encoder.weight.T
+                cdn = cd / (cd.norm(dim=0, keepdim=True) + 1e-8)
+                Ccos = cdn.T @ cdn
+                Coff = (Ccos - torch.diag(torch.diag(Ccos))).abs().reshape(-1)
+                if Coff.numel() > 0:
+                    child_off.append(Coff)
+            if child_off:
+                child_off = torch.cat(child_off)
+                child_cos_p95 = torch.quantile(child_off, 0.95).item()
+            else:
+                child_cos_p95 = 0.0
+
+            # Usage and L0
+            active_parents = torch.sum(parent_codes > 0, dim=1).float().mean().item()
+            active_children = torch.sum(child_codes > 0, dim=(1, 2)).float().mean().item()
+
+        # Router temp closeness
+        tau = float(model.router_temperature.item()) if hasattr(model, "router_temperature") else temp_end
+        tau_ok = abs(tau - temp_end) <= temp_tol
+
+        # Conditions
+        conds = {
+            "ev_ok": (final_ev_val >= ev_target),
+            "tau_ok": tau_ok,
+            "parent_cos_ok": (parent_cos_p95 <= parent_cos_p95_max),
+            "child_cos_ok": (child_cos_p95 <= child_cos_p95_max),
+            "parents_l0_ok": (0.9 <= active_parents <= 1.1),
+            "children_l0_ok": (0.9 <= active_children <= 1.1),
+        }
+
+        logger.info("=" * 50)
+        logger.info("PHASE 2 SUCCESS GATE (informational)")
+        logger.info("=" * 50)
+        logger.info(f"EV >= {ev_target:.2f}: {'PASS' if conds['ev_ok'] else 'FAIL'} (EV={final_ev_val:.4f})")
+        logger.info(f"τ≈{temp_end:.2f} (±{temp_tol:.2f}): {'PASS' if conds['tau_ok'] else 'FAIL'} (τ={tau:.2f})")
+        logger.info(f"Parent decoder cos p95 ≤ {parent_cos_p95_max:.2f}: {'PASS' if conds['parent_cos_ok'] else 'FAIL'} (p95={parent_cos_p95:.3f})")
+        logger.info(f"Child decoder cos p95 ≤ {child_cos_p95_max:.2f}: {'PASS' if conds['child_cos_ok'] else 'FAIL'} (p95={child_cos_p95:.3f})")
+        logger.info(f"Active parents/token ≈ 1: {'PASS' if conds['parents_l0_ok'] else 'FAIL'} ({active_parents:.2f})")
+        logger.info(f"Active children/token ≈ 1: {'PASS' if conds['children_l0_ok'] else 'FAIL'} ({active_children:.2f})")
+        overall = all(conds.values())
+        logger.info(f"Overall: {'PASS' if overall else 'FAIL'}")
+        results["success_gate"] = {**conds, "overall": overall,
+                                    "parent_cos_p95": parent_cos_p95, "child_cos_p95": child_cos_p95,
+                                    "tau": tau,
+                                    "ev_target": ev_target,
+                                    "parent_cos_p95_max": parent_cos_p95_max,
+                                    "child_cos_p95_max": child_cos_p95_max,
+                                    "tau_target": temp_end,
+                                    "tau_tolerance": temp_tol,
+                                    "active_parents": active_parents,
+                                    "active_children": active_children}
+    except Exception as e:
+        logger.warning(f"Could not compute Phase 2 success gate: {e}")
+
     results_file = exp_dir / "baseline_results.json"
     with open(results_file, "w") as f:
         json.dump(results, f, indent=2, default=str)
