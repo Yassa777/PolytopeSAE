@@ -280,11 +280,15 @@ class HSAETrainer:
         l1_loss = l1_mult * (metrics["l1_parent"] + metrics["l1_child"])
 
         top_level_loss = torch.zeros((), device=batch.device)
-        if (
-            hasattr(self.model.config, "top_level_beta")
-            and self.model.config.top_level_beta > 0
-        ):
-            top_level_loss = self.model.config.top_level_beta * top_level_recon
+        # Allow stage-specific top-level reconstruction weighting
+        beta = getattr(self.model.config, "top_level_beta", 0.0)
+        tcfg = self.config.get("training", {}).get("teacher_init", {})
+        if stage == "stabilize":
+            beta = float(tcfg.get("stage_A", {}).get("top_level_beta", beta))
+        elif stage == "adapt":
+            beta = float(tcfg.get("stage_B", {}).get("top_level_beta", beta))
+        if beta > 0:
+            top_level_loss = beta * top_level_recon
 
         biorth_loss = metrics.get("biorth_penalty", torch.zeros((), device=batch.device))
 

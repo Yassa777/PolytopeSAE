@@ -52,34 +52,34 @@ hsae:
   # Adjusted for Pythia-410M (hidden_size=1024)
   m_top: 16                  # Reduced for smaller model
   topk_parent: 1             # K=1 aligns with geometry & ablations
-  subspace_dim: 32           # Reduced for smaller model (33 active dims/token)
+  subspace_dim: 16           # Smaller subspace for faster/cleaner alignment
   m_low: 8                   # Keep same child choices per parent
   topk_child: 1              # K=1 for geometric consistency
   projectors_init: "svd_from_teacher"
   l1_parent: 2.0e-4          # Reduced, will add warmup
   l1_child: 2.0e-4           # Reduced, will add warmup  
-  biorth_lambda: 1.0e-4      # Keep low until EV fits
+  biorth_lambda: 1.0e-3      # Stronger cross-orthogonality for baseline
   causal_ortho_lambda: 2.0e-4  # Applied only during freeze stage
   router_temp: {start: 5.0, end: 0.7}  # Higher start to encourage exploration in Stage A
-  top_level_beta: 0.3        # Emphasize reconstruction
+  top_level_beta: 0.1        # Emphasize reconstruction (lower in Stage B)
   
   # Our default settings (teacher-init friendly)
   use_tied_decoders_parent: false
   use_tied_decoders_child: false
   tie_projectors: false
   use_decoder_bias: true
-  use_offdiag_biorth: false
+  use_offdiag_biorth: true
 
 training:
   optimizer: adamw
-  lr: 2.5e-4                 # Stable learning rate
+  lr: 3.0e-4                 # Slightly higher LR for faster alignment
   weight_decay: 1.0e-4
   grad_clip: 1.0
   batch_size_acts: 1024      # SANITY: Small enough for val (ensure ≤ len(val_ds))
   grad_accum_steps: 4        # Use grad accumulation instead of large batches (effective=4096)
   lr_schedule: "cosine"      # Add cosine annealing
   lr_warmup_steps: 1000      # Longer warmup for stability
-  l1_warmup_steps: 1000      # Warmup L1 from 0 → target over 1k steps (≥ stabilize_steps)
+  l1_warmup_steps: 2000      # Longer L1 warmup for baseline stability
   
   # Fast training settings for small model
   val_every: 500             # Less frequent validation
@@ -87,28 +87,30 @@ training:
   
   # Baseline H-SAE training - FAST SCHEDULE
   baseline:
-    total_steps: 5000        # Reduced for faster experimentation
+    total_steps: 10000       # More steps for better EV and orthogonality
     init_method: "random"
     schedule_only_freeze: true  # run baseline with same freeze→adapt schedule
     stabilize_steps: 500     # Stage A: cheap decoder-frozen stabilization
-    adapt_steps: 4500        # Stage B: remaining steps for adaptation
+    adapt_steps: 9500        # Stage B: remaining steps for adaptation
   
   # Teacher-initialized H-SAE training  
   teacher_init:
-    total_steps: 5000        # Matched with baseline for fair comparison
-    teacher_noise_deg: [0, 5, 15, 30]  # ablation: angular noise on teacher
+    total_steps: 10000       # Match baseline for fair comparison
+    teacher_noise_deg: [0]             # clean teacher only for main run
     l1_warmup_steps: 4000    # Extended L1 warmup for teacher-init stability
     stage_A:
       freeze_decoder: true
       steps: 500             # Cheap stabilization (was 2000)
       lr_mult: 0.5
       enable_causal_ortho: true
+      top_level_beta: 0.30   # stronger parent-only parity early
     stage_B:
       freeze_decoder: false
-      steps: 4500            # Main adaptation phase
+      steps: 9500            # Main adaptation phase
       lr_mult: 1.0
       enable_causal_ortho: false
-      decoder_lr_mult: 0.5  # Lower LR for decoder adaptation
+      decoder_lr_mult: 1.0  # Allow decoder to adapt fully
+      top_level_beta: 0.05   # relax parent-only anchor for EV
     
     # Override sanity checker for teacher-init (disable to prevent restarts)
     sanity_checker:
@@ -134,6 +136,8 @@ eval:
     purity_improvement: 0.10    # +10pp with teacher-init
     leakage_reduction: 0.20     # -20% reduction
     steering_leakage_reduction: 0.20  # -20% reduction
+  assertions:
+    identity_max_error_tol: 0.03
 
 ablate:
   euclidean_vs_causal: true    # Critical for demonstrating necessity
@@ -150,7 +154,7 @@ logging:
   # Specific logging for phases
   phase_1_log: "teacher_extraction"
   phase_2_log: "baseline_hsae" 
-  phase_3_log: "teacher_init_hsae"
+  phase_3_log: "teacher_init_hsae_clean"
   phase_4_log: "evaluation_steering"
 
 # Sanity checker configuration
