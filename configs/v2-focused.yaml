@@ -52,13 +52,13 @@ hsae:
   # Adjusted for Pythia-410M (hidden_size=1024)
   m_top: 16                  # Reduced for smaller model
   topk_parent: 1             # K=1 aligns with geometry & ablations
-  subspace_dim: 16           # Smaller subspace for faster/cleaner alignment
+  subspace_dim: 32           # Restore capacity for decoder decorrelation
   m_low: 8                   # Keep same child choices per parent
   topk_child: 1              # K=1 for geometric consistency
   projectors_init: "svd_from_teacher"
   l1_parent: 2.0e-4          # Reduced, will add warmup
   l1_child: 2.0e-4           # Reduced, will add warmup  
-  biorth_lambda: 1.0e-3      # Stronger cross-orthogonality for baseline
+  biorth_lambda: 5.0e-4      # Moderate cross-orthogonality
   causal_ortho_lambda: 2.0e-4  # Applied only during freeze stage
   router_temp: {start: 5.0, end: 0.7}  # Higher start to encourage exploration in Stage A
   top_level_beta: 0.1        # Emphasize reconstruction (lower in Stage B)
@@ -68,7 +68,7 @@ hsae:
   use_tied_decoders_child: false
   tie_projectors: false
   use_decoder_bias: true
-  use_offdiag_biorth: true
+  use_offdiag_biorth: false
 
 training:
   optimizer: adamw
